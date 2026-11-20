@@ -6,8 +6,8 @@ opcode is dispatched through a balanced if-tree (8 compares). Memory is a flat
 bytearray; only accesses that can hit the I/O page go through callbacks:
 
   reads  of $8002/$8003            -> rd_io(addr)
-  writes to $8000-$80FF            -> wr_io(addr, value)
-  writes to $8100-$FFFF (ROM)      -> ignored
+  writes to $8000-$FFFF            -> wr_io(addr, value); the machine ignores
+                                      writes to the ROM unless it is switched off
 
 which is exactly how the Pico firmware (core 1) serves the real 65C02 bus.
 Cycle counts are the base WDC counts (no page-crossing penalties).
@@ -212,7 +212,7 @@ def _write(mode, expr):
     if mode in ZP_MODES:
         return ['m[ea] = ' + expr]
     return ['if ea <= 0x%04X:' % RAM_END, '    m[ea] = ' + expr,
-            'elif ea <= 0x%04X:' % IO_END, '    wr_io(ea, ' + expr + ')']
+            'else:', '    wr_io(ea, ' + expr + ')']      # I/O page, or RAM above it when the ROM is off
 
 
 def _branch(cond):

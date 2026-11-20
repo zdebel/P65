@@ -1,8 +1,8 @@
 # P65
 
 **P65** is a small handheld computer: a Raspberry Pi Pico (RP2040) drives a real WDC W65C02S
-and emulates a TMS9918 video chip on an ILI9341 LCD. This repository holds the **desktop emulator**
-of the P65 (Python + Qt6); the firmware and hardware are not included yet.
+and emulates a TMS9918 video chip on an ILI9341 LCD. This repository holds the **firmware** (`firmware/`) and the **desktop emulator**
+of the P65 (Python + Qt6, `emulator/`); the hardware files are not included yet.
 
 ## Run it
 
@@ -38,6 +38,7 @@ Press **F1** in the emulator for the keyboard layout and shortcuts.
 | `$8000` | LEDs (bits 0-2) |
 | `$8001` | keyboard |
 | `$8002 / $8003` | VDP data / control and status |
+| `$8004` | ROM control: write 1 = ROM off (RAM at `$8100-$FFFF`), 0 = ROM on |
 | `$8010-$802F` | storage mailbox |
 | `$8100-$FFFF` | ROM (BASIC at `$C000`, monitor at `$F000`, vectors at `$FFFA`) |
 

@@ -19,13 +19,18 @@ IO_REG_LEDS = 0x00          # W: bits 0-2 = LED0..2           R: 0xF8 | leds
 IO_REG_KEY = 0x01           # bit 7 = key waiting, write acknowledges
 IO_REG_VDATA = 0x02         # VDP data
 IO_REG_VCTRL = 0x03         # VDP: write = address / register, read = status
+IO_REG_ROMCTL = 0x04        # W bit0: 1 = ROM off (RAM above the I/O page), 0 = ROM on (image restored)
+                            # R bit0 = ROM off, bit7 = busy (restoring the image)
 IO_REG_STORAGE = 0x10       # storage mailbox (see storage.py)
+ROMCTL_OFF = 0x01
+ROMCTL_BUSY = 0x80
 
 IO_LEDS = IO_START + IO_REG_LEDS
 IO_KEY = IO_START + IO_REG_KEY
 IO_VDATA = IO_START + IO_REG_VDATA
 IO_VCTRL = IO_START + IO_REG_VCTRL
 IO_STORAGE = IO_START + IO_REG_STORAGE
+IO_ROMCTL = IO_START + IO_REG_ROMCTL
 
 assert IO_START % 0x100 == 0 and IO_END == IO_START + 0xFF
 assert IO_VDATA % 2 == 0 and IO_VCTRL == IO_VDATA + 1       # the CPU core reads both through one test

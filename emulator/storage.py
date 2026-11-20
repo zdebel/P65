@@ -70,6 +70,14 @@ class Store:
             raise StorageError(-1, 'cannot open storage image %s: %s' % (path, e))
         self.proto = P.ProtoServer(self.fs)
         self._ops_reset()
+        if path and not os.path.exists(path):
+            # a new image: create the file right away (an empty one is all 0xFF), so
+            # choosing a name that does not exist yet really makes a storage file
+            try:
+                with open(path, 'wb') as f:
+                    f.write(self.flash.img)
+            except OSError as e:
+                raise StorageError(-1, 'cannot create storage image %s: %s' % (path, e))
 
     def _ops_reset(self):
         self.flash.erases = self.flash.programs = 0

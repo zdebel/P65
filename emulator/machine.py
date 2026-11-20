@@ -6,8 +6,10 @@ Memory map (src/mapper.h):
     $8001        keyboard   bit 7 = new key; any write clears bit 7
     $8002        VDP data   (read/write, auto-increment)
     $8003        VDP        read = status (clears it), write = address/register
-    $8004-$80FF  unused     writes ignored, reads 0
-    $8100-$FFFF  ROM (32512 bytes, writes ignored)
+    $8004        ROMCTL     write bit0: 1 = ROM off (RAM), 0 = ROM on (image restored)
+                            read: bit0 = ROM off, bit7 = busy restoring
+    $8005-$80FF  unused     writes ignored, reads 0 ($8010+ = storage mailbox)
+    $8100-$FFFF  ROM (32512 bytes, writes ignored) - or RAM while ROMCTL bit0 = 1
 """
 
 import base64
@@ -19,7 +21,8 @@ import re
 from cpu65c02 import CPU65C02
 from tms9918 import TMS9918
 from memmap import (RAM_END, IO_START, IO_END, ROM_START, ROM_END, ROM_SIZE,
-                    IO_LEDS, IO_KEY, IO_VDATA, IO_VCTRL, IO_STORAGE)
+                    IO_LEDS, IO_KEY, IO_VDATA, IO_VCTRL, IO_STORAGE, IO_ROMCTL,
+                    ROMCTL_OFF, ROMCTL_BUSY)
 import storage as sto
 
 CPU_CLOCK = 2_000_000           # PIO: 200 MHz / 3.5714 / 28 = 2 MHz
@@ -39,6 +42,7 @@ IRQ_SLICE_CYCLES = 32
 # works in 32-cycle slices, so this number is not the real delay itself).
 # 0 = ideal interrupt controller.
 DEFAULT_IRQ_RELEASE_US = 100
+ROM_RESTORE_US = 300            # core 0 copies 32 KB ROM image back (estimate, unmeasured)
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -154,6 +158,8 @@ class P65:
         self.irq_release_us = DEFAULT_IRQ_RELEASE_US
         self._irq_release_at = None
         # storage (flash file system, the same code as the firmware) behind the mailbox registers
+        self.rom_ram = False            # ROM switched off (RAM above the I/O page)
+        self._rom_done_at = None        # abs_cycles when the ROM image is restored
         self.store = None
         self.storage_error = None
         self._sto_done_at = None        # abs_cycles when the running command completes
@@ -189,7 +195,7 @@ class P65:
         if self.store is None or self._sto_done_at is not None:
             return                                      # no storage hardware / still busy: ignored
         m = self.mem
-        erases, programs = self.store.execute(m, RAM_END, IO_STORAGE)
+        erases, programs = self.store.execute(m, 0xFFFF if self.rom_ram else RAM_END, IO_STORAGE)
         result = m[IO_STORAGE + sto.STO_STATUS]
         nbytes = m[IO_STORAGE + sto.STO_LEN_L] | m[IO_STORAGE + sto.STO_LEN_H] << 8
         ms = 0.3 + sto.op_time_ms(erases, programs, nbytes)
@@ -208,8 +214,31 @@ class P65:
             return self.vdp.read_data()
         return self.vdp.read_status()           # $8003
 
+    # ROM on/off: the firmware only flips a flag; core 0 restores the image a
+    # moment later (ROMCTL_BUSY until then). ROM_RESTORE_US models that time.
+    def _romctl_write(self, v):
+        if v & ROMCTL_OFF:
+            if self._rom_done_at is None:
+                self.rom_ram = True
+                self.mem[IO_ROMCTL] = ROMCTL_OFF
+        elif self.rom_ram:
+            self.rom_ram = False
+            self.mem[IO_ROMCTL] = ROMCTL_BUSY
+            self._rom_done_at = self.abs_cycles + ROM_RESTORE_US * (CPU_CLOCK // 1_000_000)
+
+    def _update_rom(self):
+        if self._rom_done_at is not None and self.abs_cycles >= self._rom_done_at:
+            self.mem[ROM_START:ROM_END + 1] = self.rom
+            self.mem[IO_ROMCTL] = 0
+            self._rom_done_at = None
+
     def _wr_io(self, addr, v):
-        if addr == IO_VDATA:
+        if addr > IO_END:                       # above the I/O page: RAM only when the ROM is off
+            if self.rom_ram:
+                self.mem[addr] = v
+        elif addr == IO_ROMCTL:
+            self._romctl_write(v)
+        elif addr == IO_VDATA:
             self.vdp.write_data(v)
         elif addr == IO_VCTRL:
             self.vdp.write_addr(v)
@@ -239,7 +268,9 @@ class P65:
         m[0:ROM_START] = bytes(ROM_START)
         m[ROM_START:ROM_END + 1] = self.rom
         m[0x10000:] = bytes(2)
-        self.leds = 7                    # P2 bits 5-7 low after the boot sequence
+        self.rom_ram = False
+        self._rom_done_at = None
+        self.leds = 7                   # P2 bits 5-7 low after the boot sequence
         m[IO_LEDS] = 0xFF
         self.kbd.reset()
         self.vdp.reset()
@@ -311,6 +342,7 @@ class P65:
             kbd.deliver()
             self._update_irq()
             self._update_storage()
+            self._update_rom()
             n = min(SLICE_CYCLES, cycles - done, FRAME_CYCLES - self.frame_pos)
             if cpu.irq or self._irq_release_at is not None:
                 n = min(n, IRQ_SLICE_CYCLES)
@@ -336,6 +368,7 @@ class P65:
         self.kbd.deliver()
         self._update_irq()
         self._update_storage()
+        self._update_rom()
         n = self.cpu.step()
         self.abs_cycles += n
         self.frame_pos += n
@@ -356,6 +389,7 @@ class P65:
                     for k, v in self.vdp.state().items()},
             'leds': self.leds,
             'frame_pos': self.frame_pos,
+            'rom_ram': self.rom_ram,
         }
         with open(path, 'w') as f:
             json.dump(s, f)
@@ -374,5 +408,7 @@ class P65:
         self.vdp.set_state(v)
         self.leds = s.get('leds', 0)
         self.frame_pos = s.get('frame_pos', 0)
+        self.rom_ram = bool(s.get('rom_ram', False))
+        self._rom_done_at = None
         self.kbd.reset()
         self.mem[IO_KEY] = 0
