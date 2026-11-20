@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+emulator/storage.img
+*.p65state
+*.png
+!docs/*.png
+.venv/
