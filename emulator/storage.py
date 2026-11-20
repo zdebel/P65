@@ -54,10 +54,21 @@ class StorageError(Exception):
         self.code = code
 
 
+def _try_build():
+    """No prebuilt library for this system: compile it once if a C compiler is there."""
+    try:
+        import build_storelib
+        build_storelib.main()
+    except (SystemExit, Exception):
+        pass
+
+
 class Store:
     """A flash image mounted through the firmware's own file system code."""
 
     def __init__(self, path=DEFAULT_IMAGE, size=DEFAULT_SIZE):
+        if not os.path.exists(DLL_PATH):
+            _try_build()
         if not os.path.exists(DLL_PATH):
             raise StorageError(-1, 'p65store%s not found - run: python build_storelib.py' % EXT)
         self._lib = lib = ctypes.CDLL(DLL_PATH)

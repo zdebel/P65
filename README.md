@@ -43,8 +43,11 @@ Press **F1** in the emulator for the keyboard layout and shortcuts.
 
 ## Notes
 
-* `emulator/p65store.dll` is the firmware's own file system code compiled for **Windows (x64)**.
-  The storage manager and `SAVE` / `LOAD` need it; on other systems the emulator runs without storage.
+* **Storage library.** The storage code is the firmware's own file system in C (`emulator/native/`), loaded
+  through ctypes. Windows x64 has a prebuilt `emulator/p65store.dll`. On Linux and macOS the emulator compiles
+  it by itself the first time storage is used, if `cc` / `gcc` / `clang` is installed (Debian/Ubuntu:
+  `sudo apt install build-essential`; macOS: `xcode-select --install`). You can also build it by hand:
+  `python emulator/build_storelib.py`. Without a compiler everything else still runs, only storage is off.
 * `emulator/rom/p65_basic.bin` is the BASIC ROM of the P65. Its interpreter descends from
   [mist64/msbasic](https://github.com/mist64/msbasic) (Microsoft BASIC), whose copyright belongs to
   its original authors; the MIT license of this repository covers the P65 code only.
