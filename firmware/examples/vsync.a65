@@ -1,0 +1,44 @@
+; VSYNC interrupt demo.
+; The VDP raises its frame flag 60 times a second. With bit 5 of VDP
+; register 1 set it also pulls the CPU's /IRQ low until $8003 is read.
+; The 3 LEDs show bits 4..6 of a frame counter (about 3.75 Hz binary count).
+;
+; The IRQ line is released a little AFTER the status read (it goes through the
+; I2C expander), so the handler can be entered again with bit 7 clear: always
+; test bit 7 of the status and ignore the interrupt when it is clear.
+
+.setcpu "W65C02"
+
+frames  = $0200
+
+.org $8100
+entry:
+        ldx     #$ff
+        txs
+        stz     frames
+        lda     #$e0            ; R1 = $E0: 16K, display on, IRQ enabled
+        sta     $8003
+        lda     #$81            ; ... write it to register 1
+        sta     $8003
+        cli
+loop:
+        wai                     ; sleep until the next interrupt
+        jmp     loop
+
+irq:
+        pha
+        lda     $8003           ; read status: clears the flag, releases /IRQ
+        bpl     done            ; bit 7 clear: spurious, ignore
+        inc     frames
+        lda     frames
+        lsr
+        lsr
+        lsr
+        lsr
+        sta     $8000           ; LEDs
+done:
+        pla
+        rti
+
+.res    $FFFA-*
+.word   entry, entry, irq       ; NMI, RESET, IRQ/BRK

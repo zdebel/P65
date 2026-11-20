@@ -1,0 +1,628 @@
+; ============================================================================
+; P65 VDP demo: waving rolling rainbow, sine-bouncing sprite text, smooth
+; scroller.
+;
+; Runs from RAM under the BASIC ROM:   BRUN "VDPDEMO"
+; (get VDPDEMO.BIN into the storage with the emulator's storage manager:
+; Import, load address $0800). Assemble with tools/asm.py. The demo takes
+; over the machine - press RESET to get back to BASIC.
+;
+;  * Graphics I mode.  The rainbow is 24 solid tile groups; the colour table is
+;    rotated every few frames (rolling) and every row of the name table starts
+;    at a different column from a sine table (waving).
+;  * The letters are 10 magnified 8x8 sprites on a sine wave, colours cycling.
+;    The wave is chosen so that never more than 4 sprites share a scanline.
+;  * The scroller redefines 32 tile patterns every frame: a 256x8 bit buffer is
+;    shifted left by one pixel (ROL chains) and uploaded to the pattern table.
+;  * The three LEDs run a light chaser (red, yellow, green, yellow, ...).
+;  * Everything is paced by the 60 Hz VSYNC interrupt (VDP R1 bit 5), the main
+;    loop sleeps on WAI.
+;
+; VRAM: $0000 sprite patterns (ROM font, name = ASCII)  $0800 tile patterns
+;       $1000 sprite attributes  $1400 name table  $2000 colour table
+; ============================================================================
+
+.setcpu "W65C02"
+
+VDATA     = $8002
+KEY       = $8001            ; bit 7 set = a key was pressed
+VCTRL     = $8003            ; write: address / register, read: status
+
+SCROLL_PX = 2                ; pixels per frame
+
+USRIRQ    = $03FE            ; the ROM's IRQ stub jumps through this vector ...
+ACC       = $45              ; ... and has left the interrupted A here
+
+; zero page
+frame     = $00              ; counted by the IRQ handler
+t         = $01              ; frames processed by the main loop
+t3        = $02
+t4        = $03
+cdiv      = $04
+cshift    = $05
+tc        = $06
+ph        = $07
+i         = $08
+n         = $09
+bitsleft  = $0A
+tp        = $0B              ; scroll text pointer (2 bytes)
+gp        = $0D              ; glyph pointer (2 bytes)
+ptr       = $0F              ; (2 bytes)
+feed      = $11              ; 8 bytes: glyph being shifted in (to $18)
+ldiv      = $19              ; frames until the LED chaser moves on
+lpos      = $1A              ; position in the chaser pattern
+
+LED_FRAMES = 6               ; chaser speed: one step every 6 frames (10 steps/s)
+LEDPORT   = $8000            ; bits 0-2: LED0 (red), LED1 (yellow), LED2 (green)
+
+; scroller bit buffer: 8 rows x 32 bytes (one row = 256 pixels), in free RAM above the demo
+row0      = $1800
+row1      = $1820
+row2      = $1840
+row3      = $1860
+row4      = $1880
+row5      = $18A0
+row6      = $18C0
+row7      = $18E0
+
+.macro vram_write addr
+          lda       #<(addr)
+          sta       VCTRL
+          lda       #(((addr) >> 8) | $40)
+          sta       VCTRL
+.endmacro
+
+.macro SHROW rn, rowarr
+          asl       feed+rn              ; MSB of the incoming glyph row -> carry
+          ldx       #31
+:         rol       rowarr,x             ; shift the row left, carry runs leftwards
+          dex                            ; (DEX does not touch the carry)
+          bpl       :-
+.endmacro
+
+.org $0800                   ; BRUN starts here (the file's load and exec address)
+
+; ---------------------------------------------------------------------------
+reset:
+          sei                                ; BRUN arrives with interrupts enabled
+          cld
+          ldx       #$ff
+          txs
+          lda       #<irq                    ; the ROM's IRQ stub jumps here (A is in ACC)
+          sta       USRIRQ
+          lda       #>irq
+          sta       USRIRQ+1
+          ldx       #$1a
+          lda       #$00
+:         sta       $00,x                ; clear our zero page
+          dex
+          bpl       :-
+          lda       #1                   ; LEDs: start the chaser at LED0
+          sta       LEDPORT
+
+          ; VDP registers
+          ldx       #0
+:         lda       vdpregs,x
+          sta       VCTRL
+          txa
+          ora       #$80
+          sta       VCTRL
+          inx
+          cpx       #8
+          bne       :-
+
+          ; sprite patterns: the ROM font (128 glyphs) -> $0000, sprite name = ASCII
+          vram_write $0000
+          lda       #<font
+          sta       ptr
+          lda       #>font
+          sta       ptr+1
+          ldx       #4
+@page:    ldy       #0
+:         lda       (ptr),y
+          sta       VDATA
+          iny
+          bne       :-
+          inc       ptr+1
+          dex
+          bne       @page
+
+          ; tile patterns: 256 solid blocks ($0800-$0FFF); the scroller rewrites the last 32
+          vram_write $0800
+          ldx       #8
+          lda       #$ff
+@fill:    ldy       #0
+:         sta       VDATA
+          iny
+          bne       :-
+          dex
+          bne       @fill
+
+          ; name table: rows 6-17 are black ($C0, colour group 24); row 16 is the scroller
+          vram_write $14C0
+          ldx       #10                  ; rows 6..15
+@blk:     ldy       #32
+          lda       #$c0
+:         sta       VDATA
+          dey
+          bne       :-
+          dex
+          bne       @blk
+          ldx       #224                 ; row 16: tiles 224..255 (scroller)
+:         stx       VDATA
+          inx
+          bne       :-
+          ldy       #32                  ; row 17
+          lda       #$c0
+:         sta       VDATA
+          dey
+          bne       :-
+
+          ; scroller buffer and text
+          ldx       #0
+          lda       #0
+:         sta       row0,x
+          inx
+          bne       :-
+          lda       #<scrolltext
+          sta       tp
+          lda       #>scrolltext
+          sta       tp+1
+          lda       #1
+          sta       bitsleft
+
+          jsr       update               ; first picture
+          lda       #$e1                 ; now switch the display on (R1 = $E1)
+          sta       VCTRL
+          lda       #$81
+          sta       VCTRL
+          lda       VCTRL                ; discard a stale frame flag
+          cli
+
+main:     lda       frame
+@wait:    wai                            ; sleep until the next interrupt
+          cmp       frame
+          beq       @wait
+          lda       KEY                  ; any key leaves the demo ...
+          bmi       leave
+          jsr       update
+          bra       main
+
+leave:    sei                            ; ... by jumping through the ROM's reset vector
+          jmp       ($FFFC)
+
+; ---------------------------------------------------------------------------
+; VSYNC interrupt: the IRQ line is released a little after the status read, so
+; this can be entered again with the frame flag clear - those entries are ignored.
+irq:      lda       VCTRL                ; read status: clears the flag, releases /IRQ
+          bpl       @done
+          inc       frame
+@done:    lda       ACC                  ; the ROM's IRQ stub saved A here
+          rti
+
+; ---------------------------------------------------------------------------
+; one animation step
+update:
+          inc       t
+          lda       t
+          asl
+          clc
+          adc       t
+          sta       t3                   ; 3t
+          lda       t
+          asl
+          asl
+          sta       t4                   ; 4t
+
+          inc       cdiv                 ; rainbow rolls one group every 3 frames
+          lda       cdiv
+          cmp       #3
+          bcc       @c1
+          stz       cdiv
+          inc       cshift
+          lda       cshift
+          cmp       #24
+          bcc       @c1
+          stz       cshift
+@c1:      lda       t                    ; letter colours move on every 4 frames
+          and       #3
+          bne       @c2
+          inc       tc
+          lda       tc
+          cmp       #10
+          bcc       @c2
+          stz       tc
+@c2:      inc       ldiv                 ; LED light chaser: 0 1 2 1 0 1 2 1 ...
+          lda       ldiv
+          cmp       #LED_FRAMES
+          bcc       @c3
+          stz       ldiv
+          lda       lpos
+          inc
+          and       #3
+          sta       lpos
+          tax
+          lda       ledtab,x
+          sta       LEDPORT
+@c3:
+
+          ; --- colour table: 24 rotated rainbow entries + 4 black + 4 white-on-black
+          vram_write $2000
+          ldx       cshift
+          ldy       #24
+:         lda       rb48,x
+          sta       VDATA
+          inx
+          dey
+          bne       :-
+          ldx       #0
+:         lda       colstatic,x
+          sta       VDATA
+          inx
+          cpx       #8
+          bne       :-
+
+          ; --- name table: 6 rainbow rows at the top, 6 at the bottom
+          vram_write $1400
+          lda       t3
+          sta       ph
+          lda       #6
+          sta       i
+:         lda       ph
+          jsr       rainbow_row
+          lda       ph
+          clc
+          adc       #13
+          sta       ph
+          dec       i
+          bne       :-
+          vram_write $1640
+          lda       #6
+          sta       i
+:         lda       ph
+          jsr       rainbow_row
+          lda       ph
+          clc
+          adc       #13
+          sta       ph
+          dec       i
+          bne       :-
+
+          ; --- the 10 letter sprites
+          vram_write $1000
+          stz       i
+@spr:     ldx       i
+          lda       t4
+          clc
+          adc       yph,x
+          tay
+          lda       ysin,y
+          sta       VDATA                ; Y
+          lda       t3
+          clc
+          adc       xph,x
+          tay
+          lda       xs,y
+          clc
+          adc       basex,x
+          sta       VDATA                ; X
+          lda       letters,x
+          sta       VDATA                ; pattern = ASCII
+          txa
+          clc
+          adc       tc
+          tay
+          lda       tcol20,y
+          sta       VDATA                ; colour
+          inc       i
+          lda       i
+          cmp       #10
+          bne       @spr
+          lda       #$d0                 ; end of the sprite list
+          sta       VDATA
+
+          ; --- scroller
+          lda       #SCROLL_PX
+          sta       n
+:         jsr       scroll1
+          dec       n
+          bne       :-
+          vram_write $0F00
+          ldy       #0
+:         lda       row0,y
+          sta       VDATA
+          lda       row1,y
+          sta       VDATA
+          lda       row2,y
+          sta       VDATA
+          lda       row3,y
+          sta       VDATA
+          lda       row4,y
+          sta       VDATA
+          lda       row5,y
+          sta       VDATA
+          lda       row6,y
+          sta       VDATA
+          lda       row7,y
+          sta       VDATA
+          iny
+          cpy       #32
+          bne       :-
+          rts
+
+; ---------------------------------------------------------------------------
+; one row of 32 name table entries; A = phase into the wave table
+rainbow_row:
+          tax
+          lda       wob,x                ; start column 4..20
+          tax
+          ldy       #32
+:         lda       grp48,x
+          sta       VDATA
+          inx
+          dey
+          bne       :-
+          rts
+
+; ---------------------------------------------------------------------------
+; shift the scroller left by one pixel, feed in the next bit of the text
+scroll1:
+          SHROW 0, row0
+          SHROW 1, row1
+          SHROW 2, row2
+          SHROW 3, row3
+          SHROW 4, row4
+          SHROW 5, row5
+          SHROW 6, row6
+          SHROW 7, row7
+          dec       bitsleft
+          bne       @done
+          lda       #8                   ; glyph used up: fetch the next character
+          sta       bitsleft
+          lda       (tp)
+          bne       @have
+          lda       #<scrolltext         ; end of text: start again
+          sta       tp
+          lda       #>scrolltext
+          sta       tp+1
+          lda       (tp)
+@have:    inc       tp
+          bne       :+
+          inc       tp+1
+:         sta       gp                   ; glyph address = font + char * 8
+          stz       gp+1
+          asl       gp
+          rol       gp+1
+          asl       gp
+          rol       gp+1
+          asl       gp
+          rol       gp+1
+          clc
+          lda       gp+1
+          adc       #>font
+          sta       gp+1
+          ldy       #7
+:         lda       (gp),y
+          sta       feed,y
+          dey
+          bpl       :-
+@done:    rts
+
+; ---------------------------------------------------------------------------
+vdpregs:  .byte     $00, $A1, $05, $80, $01, $20, $00, $01
+          ; R0 graphics I | R1 16K, display OFF (until the first picture is ready), IRQ on,
+          ;   sprites 8x8 magnified - $E1 turns the display on
+          ; R2 names $1400 | R3 colours $2000 | R4 patterns $0800
+          ; R5 sprite attributes $1000 | R6 sprite patterns $0000 | R7 black
+colstatic: .byte    $11, $11, $11, $11, $F1, $F1, $F1, $F1
+ledtab:   .byte     $01, $02, $04, $02    ; light chaser: LED0, LED1, LED2, LED1, ...
+
+; 24 rainbow colours (12 hues, each twice), repeated so a window of 24 never wraps
+rb48:  .byte $66, $66, $88, $88, $99, $99, $AA, $AA, $BB, $BB, $33, $33
+       .byte $22, $22, $CC, $CC, $77, $77, $55, $55, $44, $44, $DD, $DD
+       .byte $66, $66, $88, $88, $99, $99, $AA, $AA, $BB, $BB, $33, $33
+       .byte $22, $22, $CC, $CC, $77, $77, $55, $55, $44, $44, $DD, $DD
+; name table entries: colour group k mod 24 (solid block tile = group * 8)
+grp48:  .byte $00, $08, $10, $18, $20, $28, $30, $38, $40, $48, $50, $58
+        .byte $60, $68, $70, $78, $80, $88, $90, $98, $A0, $A8, $B0, $B8
+        .byte $00, $08, $10, $18, $20, $28, $30, $38, $40, $48, $50, $58
+        .byte $60, $68, $70, $78, $80, $88, $90, $98, $A0, $A8, $B0, $B8
+        .byte $00, $08, $10, $18, $20, $28, $30, $38
+; stripe shift per row: 12 + 8 sin
+wob:  .byte $0C, $0C, $0C, $0D, $0D, $0D, $0D, $0D, $0E, $0E, $0E, $0E, $0E, $0F, $0F, $0F
+      .byte $0F, $0F, $0F, $10, $10, $10, $10, $10, $10, $11, $11, $11, $11, $11, $11, $12
+      .byte $12, $12, $12, $12, $12, $12, $12, $13, $13, $13, $13, $13, $13, $13, $13, $13
+      .byte $13, $13, $14, $14, $14, $14, $14, $14, $14, $14, $14, $14, $14, $14, $14, $14
+      .byte $14, $14, $14, $14, $14, $14, $14, $14, $14, $14, $14, $14, $14, $14, $14, $13
+      .byte $13, $13, $13, $13, $13, $13, $13, $13, $13, $13, $12, $12, $12, $12, $12, $12
+      .byte $12, $12, $11, $11, $11, $11, $11, $11, $10, $10, $10, $10, $10, $10, $0F, $0F
+      .byte $0F, $0F, $0F, $0F, $0E, $0E, $0E, $0E, $0E, $0D, $0D, $0D, $0D, $0D, $0C, $0C
+      .byte $0C, $0C, $0C, $0B, $0B, $0B, $0B, $0B, $0A, $0A, $0A, $0A, $0A, $09, $09, $09
+      .byte $09, $09, $09, $08, $08, $08, $08, $08, $08, $07, $07, $07, $07, $07, $07, $06
+      .byte $06, $06, $06, $06, $06, $06, $06, $05, $05, $05, $05, $05, $05, $05, $05, $05
+      .byte $05, $05, $04, $04, $04, $04, $04, $04, $04, $04, $04, $04, $04, $04, $04, $04
+      .byte $04, $04, $04, $04, $04, $04, $04, $04, $04, $04, $04, $04, $04, $04, $04, $05
+      .byte $05, $05, $05, $05, $05, $05, $05, $05, $05, $05, $06, $06, $06, $06, $06, $06
+      .byte $06, $06, $07, $07, $07, $07, $07, $07, $08, $08, $08, $08, $08, $08, $09, $09
+      .byte $09, $09, $09, $09, $0A, $0A, $0A, $0A, $0A, $0B, $0B, $0B, $0B, $0B, $0C, $0C
+; letter Y: 84 + 24 sin
+ysin:  .byte $54, $55, $55, $56, $56, $57, $58, $58, $59, $59, $5A, $5A, $5B, $5C, $5C, $5D
+       .byte $5D, $5E, $5E, $5F, $5F, $60, $60, $61, $61, $62, $62, $63, $63, $64, $64, $65
+       .byte $65, $65, $66, $66, $67, $67, $67, $68, $68, $68, $69, $69, $69, $69, $6A, $6A
+       .byte $6A, $6A, $6B, $6B, $6B, $6B, $6B, $6B, $6C, $6C, $6C, $6C, $6C, $6C, $6C, $6C
+       .byte $6C, $6C, $6C, $6C, $6C, $6C, $6C, $6C, $6C, $6B, $6B, $6B, $6B, $6B, $6B, $6A
+       .byte $6A, $6A, $6A, $69, $69, $69, $69, $68, $68, $68, $67, $67, $67, $66, $66, $65
+       .byte $65, $65, $64, $64, $63, $63, $62, $62, $61, $61, $60, $60, $5F, $5F, $5E, $5E
+       .byte $5D, $5D, $5C, $5C, $5B, $5A, $5A, $59, $59, $58, $58, $57, $56, $56, $55, $55
+       .byte $54, $53, $53, $52, $52, $51, $50, $50, $4F, $4F, $4E, $4E, $4D, $4C, $4C, $4B
+       .byte $4B, $4A, $4A, $49, $49, $48, $48, $47, $47, $46, $46, $45, $45, $44, $44, $43
+       .byte $43, $43, $42, $42, $41, $41, $41, $40, $40, $40, $3F, $3F, $3F, $3F, $3E, $3E
+       .byte $3E, $3E, $3D, $3D, $3D, $3D, $3D, $3D, $3C, $3C, $3C, $3C, $3C, $3C, $3C, $3C
+       .byte $3C, $3C, $3C, $3C, $3C, $3C, $3C, $3C, $3C, $3D, $3D, $3D, $3D, $3D, $3D, $3E
+       .byte $3E, $3E, $3E, $3F, $3F, $3F, $3F, $40, $40, $40, $41, $41, $41, $42, $42, $43
+       .byte $43, $43, $44, $44, $45, $45, $46, $46, $47, $47, $48, $48, $49, $49, $4A, $4A
+       .byte $4B, $4B, $4C, $4C, $4D, $4E, $4E, $4F, $4F, $50, $50, $51, $52, $52, $53, $53
+; letter X wobble: 3 + 3 sin
+xs:  .byte $03, $03, $03, $03, $03, $03, $03, $04, $04, $04, $04, $04, $04, $04, $04, $04
+     .byte $04, $04, $04, $04, $04, $04, $05, $05, $05, $05, $05, $05, $05, $05, $05, $05
+     .byte $05, $05, $05, $05, $05, $05, $05, $05, $05, $06, $06, $06, $06, $06, $06, $06
+     .byte $06, $06, $06, $06, $06, $06, $06, $06, $06, $06, $06, $06, $06, $06, $06, $06
+     .byte $06, $06, $06, $06, $06, $06, $06, $06, $06, $06, $06, $06, $06, $06, $06, $06
+     .byte $06, $06, $06, $06, $06, $06, $06, $06, $05, $05, $05, $05, $05, $05, $05, $05
+     .byte $05, $05, $05, $05, $05, $05, $05, $05, $05, $05, $05, $04, $04, $04, $04, $04
+     .byte $04, $04, $04, $04, $04, $04, $04, $04, $04, $04, $03, $03, $03, $03, $03, $03
+     .byte $03, $03, $03, $03, $03, $03, $03, $02, $02, $02, $02, $02, $02, $02, $02, $02
+     .byte $02, $02, $02, $02, $02, $02, $01, $01, $01, $01, $01, $01, $01, $01, $01, $01
+     .byte $01, $01, $01, $01, $01, $01, $01, $01, $01, $00, $00, $00, $00, $00, $00, $00
+     .byte $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00
+     .byte $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00
+     .byte $00, $00, $00, $00, $00, $00, $00, $00, $01, $01, $01, $01, $01, $01, $01, $01
+     .byte $01, $01, $01, $01, $01, $01, $01, $01, $01, $01, $01, $02, $02, $02, $02, $02
+     .byte $02, $02, $02, $02, $02, $02, $02, $02, $02, $02, $03, $03, $03, $03, $03, $03
+; PORTABLE 65 (without the space)
+letters:  .byte $50, $4F, $52, $54, $41, $42, $4C, $45, $36, $35
+basex:  .byte $30, $3E, $4C, $5A, $68, $76, $84, $92, $AE, $BC
+; phase offsets 52 per letter: <= 4 sprites on any scanline
+yph:  .byte $00, $34, $68, $9C, $D0, $04, $38, $6C, $A0, $D4
+xph:  .byte $00, $25, $4A, $6F, $94, $B9, $DE, $03, $28, $4D
+tcol20:  .byte $09, $0B, $03, $07, $05, $0D, $0F, $08, $0A, $02
+         .byte $09, $0B, $03, $07, $05, $0D, $0F, $08, $0A, $02
+
+scrolltext:
+          .byte     "    *** PORTABLE 65 *** W65C02S + EMULAT"
+          .byte     "ED TMS9918 *** 60 FPS WITH VSYNC IRQ ***"
+          .byte     " RAINBOWS, SINE SPRITES AND A SMOOTH SCR"
+          .byte     "OLLER *** GREETINGS TO ALL 6502 FANS ***"
+          .byte     "    "
+          .byte     0
+
+          .align    256
+; ROM font: 128 glyphs of 8 bytes, index = ASCII (copied from p65_basic.a65)
+font:  .byte $00, $00, $00, $00, $00, $00, $00, $00
+       .byte $E0, $E0, $E0, $E0, $00, $00, $00, $00
+       .byte $1C, $1C, $1C, $1C, $00, $00, $00, $00
+       .byte $FC, $FC, $FC, $FC, $00, $00, $00, $00
+       .byte $00, $00, $00, $00, $E0, $E0, $E0, $E0
+       .byte $E0, $E0, $E0, $E0, $E0, $E0, $E0, $E0
+       .byte $1C, $1C, $1C, $1C, $E0, $E0, $E0, $E0
+       .byte $FC, $FC, $FC, $FC, $E0, $E0, $E0, $E0
+       .byte $00, $00, $00, $00, $1C, $1C, $1C, $1C
+       .byte $E0, $E0, $E0, $E0, $1C, $1C, $1C, $1C
+       .byte $1C, $1C, $1C, $1C, $1C, $1C, $1C, $1C
+       .byte $FC, $FC, $FC, $FC, $1C, $1C, $1C, $1C
+       .byte $00, $00, $00, $00, $FC, $FC, $FC, $FC
+       .byte $E0, $E0, $E0, $E0, $FC, $FC, $FC, $FC
+       .byte $1C, $1C, $1C, $1C, $FC, $FC, $FC, $FC
+       .byte $FC, $FC, $FC, $FC, $FC, $FC, $FC, $FC
+       .byte $00, $00, $00, $3C, $20, $20, $20, $20
+       .byte $00, $00, $00, $FC, $20, $20, $20, $20
+       .byte $00, $00, $00, $E0, $20, $20, $20, $20
+       .byte $20, $20, $20, $20, $20, $20, $20, $20
+       .byte $20, $20, $20, $3C, $20, $20, $20, $20
+       .byte $20, $20, $20, $FC, $20, $20, $20, $20
+       .byte $20, $20, $20, $E0, $20, $20, $20, $20
+       .byte $20, $20, $20, $3C, $00, $00, $00, $00
+       .byte $20, $20, $20, $FC, $00, $00, $00, $00
+       .byte $20, $20, $20, $E0, $00, $00, $00, $00
+       .byte $00, $00, $00, $FC, $00, $00, $00, $00
+       .byte $00, $00, $70, $70, $70, $00, $00, $00
+       .byte $20, $70, $A8, $20, $20, $20, $20, $00
+       .byte $20, $20, $20, $20, $A8, $70, $20, $00
+       .byte $00, $20, $40, $F8, $40, $20, $00, $00
+       .byte $00, $20, $10, $F8, $10, $20, $00, $00
+       .byte $00, $00, $00, $00, $00, $00, $00, $00
+       .byte $20, $20, $20, $20, $20, $00, $20, $00
+       .byte $50, $50, $50, $00, $00, $00, $00, $00
+       .byte $50, $50, $F8, $50, $F8, $50, $50, $00
+       .byte $20, $70, $80, $70, $08, $70, $20, $00
+       .byte $00, $88, $10, $20, $40, $88, $00, $00
+       .byte $40, $A0, $A0, $48, $B0, $90, $68, $00
+       .byte $20, $20, $40, $00, $00, $00, $00, $00
+       .byte $10, $20, $40, $40, $40, $20, $10, $00
+       .byte $40, $20, $10, $10, $10, $20, $40, $00
+       .byte $20, $A8, $70, $20, $70, $A8, $20, $00
+       .byte $00, $20, $20, $F8, $20, $20, $00, $00
+       .byte $00, $00, $00, $00, $00, $20, $20, $40
+       .byte $00, $00, $00, $70, $00, $00, $00, $00
+       .byte $00, $00, $00, $00, $00, $00, $20, $00
+       .byte $00, $00, $08, $10, $20, $40, $80, $00
+       .byte $70, $88, $98, $A8, $C8, $88, $70, $00
+       .byte $20, $60, $20, $20, $20, $20, $70, $00
+       .byte $70, $88, $08, $30, $40, $80, $F8, $00
+       .byte $70, $88, $08, $30, $08, $88, $70, $00
+       .byte $10, $30, $50, $90, $F8, $10, $10, $00
+       .byte $F8, $80, $F0, $08, $08, $88, $70, $00
+       .byte $30, $40, $80, $F0, $88, $88, $70, $00
+       .byte $F8, $08, $10, $20, $40, $40, $40, $00
+       .byte $70, $88, $88, $70, $88, $88, $70, $00
+       .byte $70, $88, $88, $78, $08, $10, $60, $00
+       .byte $00, $00, $00, $20, $00, $20, $00, $00
+       .byte $00, $00, $00, $20, $00, $20, $20, $40
+       .byte $10, $20, $40, $80, $40, $20, $10, $00
+       .byte $00, $00, $00, $F8, $00, $F8, $00, $00
+       .byte $80, $40, $20, $10, $20, $40, $80, $00
+       .byte $70, $88, $10, $20, $20, $00, $20, $00
+       .byte $70, $88, $88, $B8, $B8, $80, $70, $00
+       .byte $20, $50, $88, $88, $F8, $88, $88, $00
+       .byte $F0, $88, $88, $F0, $88, $88, $F0, $00
+       .byte $70, $88, $80, $80, $80, $88, $70, $00
+       .byte $F0, $88, $88, $88, $88, $88, $F0, $00
+       .byte $F8, $80, $80, $F0, $80, $80, $F8, $00
+       .byte $F8, $80, $80, $F0, $80, $80, $80, $00
+       .byte $70, $88, $80, $98, $88, $88, $78, $00
+       .byte $88, $88, $88, $F8, $88, $88, $88, $00
+       .byte $70, $20, $20, $20, $20, $20, $70, $00
+       .byte $08, $08, $08, $08, $88, $88, $70, $00
+       .byte $88, $90, $A0, $C0, $A0, $90, $88, $00
+       .byte $80, $80, $80, $80, $80, $80, $F8, $00
+       .byte $88, $D8, $A8, $A8, $88, $88, $88, $00
+       .byte $88, $88, $C8, $A8, $98, $88, $88, $00
+       .byte $70, $88, $88, $88, $88, $88, $70, $00
+       .byte $F0, $88, $88, $F0, $80, $80, $80, $00
+       .byte $70, $88, $88, $88, $88, $90, $68, $00
+       .byte $F0, $88, $88, $F0, $A0, $90, $88, $00
+       .byte $70, $88, $80, $70, $08, $88, $70, $00
+       .byte $F8, $20, $20, $20, $20, $20, $20, $00
+       .byte $88, $88, $88, $88, $88, $88, $70, $00
+       .byte $88, $88, $88, $88, $88, $50, $20, $00
+       .byte $88, $88, $88, $A8, $A8, $D8, $88, $00
+       .byte $88, $88, $50, $20, $50, $88, $88, $00
+       .byte $88, $88, $88, $50, $20, $20, $20, $00
+       .byte $F8, $08, $10, $20, $40, $80, $F8, $00
+       .byte $70, $40, $40, $40, $40, $40, $70, $00
+       .byte $00, $00, $80, $40, $20, $10, $08, $00
+       .byte $70, $10, $10, $10, $10, $10, $70, $00
+       .byte $20, $50, $88, $00, $00, $00, $00, $00
+       .byte $00, $00, $00, $00, $00, $00, $00, $FC
+       .byte $40, $20, $10, $00, $00, $00, $00, $00
+       .byte $00, $00, $70, $08, $78, $88, $78, $00
+       .byte $80, $80, $B0, $C8, $88, $88, $F0, $00
+       .byte $00, $00, $70, $88, $80, $88, $70, $00
+       .byte $08, $08, $68, $98, $88, $88, $78, $00
+       .byte $00, $00, $70, $88, $F8, $80, $78, $00
+       .byte $30, $48, $40, $E0, $40, $40, $40, $00
+       .byte $00, $00, $78, $88, $88, $78, $08, $70
+       .byte $80, $80, $B0, $C8, $88, $88, $88, $00
+       .byte $20, $00, $60, $20, $20, $20, $20, $00
+       .byte $08, $00, $18, $08, $08, $08, $88, $70
+       .byte $80, $80, $88, $90, $E0, $90, $88, $00
+       .byte $60, $20, $20, $20, $20, $20, $20, $00
+       .byte $00, $00, $88, $D8, $A8, $88, $88, $00
+       .byte $00, $00, $70, $88, $88, $88, $88, $00
+       .byte $00, $00, $70, $88, $88, $88, $70, $00
+       .byte $00, $00, $B0, $C8, $88, $F0, $80, $80
+       .byte $00, $00, $68, $98, $88, $78, $08, $08
+       .byte $00, $00, $70, $88, $80, $80, $80, $00
+       .byte $00, $00, $78, $80, $70, $08, $F0, $00
+       .byte $40, $40, $E0, $40, $40, $48, $30, $00
+       .byte $00, $00, $88, $88, $88, $98, $68, $00
+       .byte $00, $00, $88, $88, $88, $50, $20, $00
+       .byte $00, $00, $88, $88, $A8, $D8, $88, $00
+       .byte $00, $00, $88, $50, $20, $50, $88, $00
+       .byte $00, $00, $88, $88, $88, $78, $08, $70
+       .byte $00, $00, $F8, $10, $20, $40, $F8, $00
+       .byte $30, $40, $40, $80, $40, $40, $30, $00
+       .byte $20, $20, $20, $00, $20, $20, $20, $00
+       .byte $60, $10, $10, $08, $10, $10, $60, $00
+       .byte $68, $B0, $00, $00, $00, $00, $00, $00
+       .byte $00, $A8, $50, $A8, $50, $A8, $00, $00

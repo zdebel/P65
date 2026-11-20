@@ -1,0 +1,11 @@
+build*/
+out*/
+*.uf2
+*.elf
+*.obj
+*.lst
+*.map
+*.dll
+*.so
+*.dylib
+tests/ref/

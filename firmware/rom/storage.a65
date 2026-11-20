@@ -1,0 +1,471 @@
+; ============================================================================
+; BASIC commands for the flash storage (included by p65_basic.a65 after fpp65.a65).
+;
+;   SAVE "NAME"            program -> NAME.BAS
+;   LOAD "NAME"            NAME.BAS -> program (replaces the current one)
+;   BSAVE "NAME",addr,len[,exec]   memory -> NAME.BIN (exec defaults to 0)
+;   BLOAD "NAME"[,addr]    NAME.BIN -> memory (at its own address unless addr given)
+;   BRUN "NAME"            load a binary at its own address and call it (RTS comes back)
+;   CATALOG                list the files
+;   ERASE "NAME"           delete a file
+;   RENAME "OLD","NEW"     rename a file
+;
+; Names are 8.3. Without an extension SAVE/LOAD use .BAS and BSAVE/BLOAD/BRUN
+; use .BIN; ERASE and RENAME try .BAS, .BIN and .TXT.
+;
+; The mailbox (include/storage.h) lives at IOBASE+$10. Only the offsets below
+; are used, the base comes from IOBASE in p65_basic.a65.
+; ============================================================================
+
+STO         =        IOBASE+$10          ; mailbox base
+
+STO_CMD     =        $00
+STO_STATUS  =        $01
+STO_ADDR_L  =        $02
+STO_ADDR_H  =        $03
+STO_LEN_L   =        $04
+STO_LEN_H   =        $05
+STO_NAME_L  =        $06
+STO_NAME_H  =        $07
+STO_NAMELEN =        $08
+STO_TYPE    =        $09
+STO_EXEC_L  =        $0A
+STO_EXEC_H  =        $0B
+STO_INDEX   =        $0C
+STO_FLAGS   =        $0D
+STO_ID      =        $0E
+STO_VERSION =        $0F
+STO_NAME2_L =        $10
+STO_NAME2_H =        $11
+STO_NAME2LEN =       $12
+STO_SIZE_0  =        $13
+STO_SIZE_1  =        $14
+STO_SIZE_2  =        $15
+
+STO_ID_VALUE =       $53
+STO_C_LOAD  =        1
+STO_C_SAVE  =        2
+STO_C_DELETE =       3
+STO_C_DIRENT =       4
+STO_C_INFO  =        5
+STO_C_FREE  =        6
+STO_C_RENAME =       7
+STO_F_ADDR  =        $01
+STO_TYPE_BIN =       0
+STO_TYPE_BAS =       1
+STO_TYPE_TXT =       2
+STO_TYPE_ANY =       $FF
+STO_E_NOTFOUND =     1
+STO_E_END   =        7
+STO_E_NOSTORAGE =    12
+
+sto_nm1     =        $03A0               ; 16 bytes: copy of the first name (the BASIC string
+sto_nm2     =        $03B0               ; 16 bytes: ... second name        may be overwritten by the next one)
+sto_buf     =        $03C0               ; 13 bytes: directory entry name
+sto_tmp     =        $03CE               ; 2 bytes of scratch
+
+; ---------------------------------------------------------------------------
+; cold start: wire the BASIC vectors (they are JMPs in RAM, so a program can
+; still replace them)
+; ---------------------------------------------------------------------------
+sto_init:   lda       #$4C
+            sta       SAVE
+            sta       LOAD
+            sta       BSAVE
+            sta       BLOAD
+            lda       #<sto_save
+            sta       SAVE+1
+            lda       #>sto_save
+            sta       SAVE+2
+            lda       #<sto_load
+            sta       LOAD+1
+            lda       #>sto_load
+            sta       LOAD+2
+            lda       #<sto_bsave
+            sta       BSAVE+1
+            lda       #>sto_bsave
+            sta       BSAVE+2
+            lda       #<sto_bload
+            sta       BLOAD+1
+            lda       #>sto_bload
+            sta       BLOAD+2
+            rts
+
+; ---------------------------------------------------------------------------
+; helpers
+; ---------------------------------------------------------------------------
+sto_check:  lda       STO+STO_ID          ; is the storage hardware there?
+            cmp       #STO_ID_VALUE
+            beq       @ok
+            lda       #STO_E_NOSTORAGE
+            jmp       sto_fail
+@ok:        rts
+
+sto_run:    sta       STO+STO_CMD         ; A = command; returns A = result, Z set if OK
+@wait:      bit       STO+STO_STATUS
+            bmi       @wait               ; BUSY
+            lda       STO+STO_STATUS
+            rts
+
+sto_do:     jsr       sto_run             ; run the command, BASIC error unless OK
+            beq       @ok
+            jmp       sto_fail
+@ok:        rts
+
+; try the default extensions .BAS, .BIN, .TXT in turn (command in A)
+sto_try:    sta       sto_tmp
+            lda       #STO_TYPE_BAS
+            sta       STO+STO_TYPE
+            lda       sto_tmp
+            jsr       sto_run
+            cmp       #STO_E_NOTFOUND
+            bne       @done
+            lda       #STO_TYPE_BIN
+            sta       STO+STO_TYPE
+            lda       sto_tmp
+            jsr       sto_run
+            cmp       #STO_E_NOTFOUND
+            bne       @done
+            lda       #STO_TYPE_TXT
+            sta       STO+STO_TYPE
+            lda       sto_tmp
+            jsr       sto_run
+@done:      cmp       #0
+            beq       @ok
+            jmp       sto_fail
+@ok:        rts
+
+; BASIC error with the storage result code in A (1..12)
+sto_fail:   and       #$7F
+            pha
+            bit       ERRFLG              ; ONERR GOTO active?
+            bmi       @onerr
+            jsr       CRDO
+            pla
+            tax
+            lda       sto_msgofs,x
+            tax
+@print:     lda       sto_msgs,x
+            pha
+            jsr       OUTDO
+            inx
+            pla
+            bpl       @print
+            jsr       STKINI
+            lda       #<QT_ERROR
+            ldy       #>QT_ERROR
+            jmp       PRINT_ERROR_LINNUM
+@onerr:     pla
+            clc
+            adc       #$A0                ; ERRNUM = 160 + storage code
+            tax
+            jmp       HANDLERR
+
+; Evaluate a string expression into the name registers. The characters are
+; copied (16 at most, longer names fail as bad names anyway): FRESTR releases the
+; string, so evaluating the next argument could overwrite it.
+sto_getname:
+            jsr       FRMEVL
+            jsr       FRESTR              ; A = length, (INDEX) = characters
+            cmp       #16
+            bcc       @len
+            lda       #16
+@len:       sta       STO+STO_NAMELEN
+            ldy       #0
+@copy:      cpy       STO+STO_NAMELEN
+            beq       @done
+            lda       (INDEX),y
+            sta       sto_nm1,y
+            iny
+            bne       @copy
+@done:      lda       #<sto_nm1
+            sta       STO+STO_NAME_L
+            lda       #>sto_nm1
+            sta       STO+STO_NAME_H
+            rts
+
+sto_getname2:
+            jsr       FRMEVL
+            jsr       FRESTR
+            cmp       #16
+            bcc       @len
+            lda       #16
+@len:       sta       STO+STO_NAME2LEN
+            ldy       #0
+@copy:      cpy       STO+STO_NAME2LEN
+            beq       @done
+            lda       (INDEX),y
+            sta       sto_nm2,y
+            iny
+            bne       @copy
+@done:      lda       #<sto_nm2
+            sta       STO+STO_NAME2_L
+            lda       #>sto_nm2
+            sta       STO+STO_NAME2_H
+            rts
+
+; ",number" -> LINNUM
+sto_getnum: jsr       CHKCOM
+            jsr       FRMNUM
+            jmp       GETADR
+
+sto_clear:  lda       #0                  ; no flags, no exec address
+            sta       STO+STO_FLAGS
+            sta       STO+STO_EXEC_L
+            sta       STO+STO_EXEC_H
+            rts
+
+; ---------------------------------------------------------------------------
+; SAVE "NAME"
+; ---------------------------------------------------------------------------
+sto_save:   jsr       sto_check
+            jsr       sto_getname
+            jsr       sto_clear
+            lda       #STO_TYPE_BAS
+            sta       STO+STO_TYPE
+            lda       TXTTAB
+            sta       STO+STO_ADDR_L
+            lda       TXTTAB+1
+            sta       STO+STO_ADDR_H
+            sec
+            lda       VARTAB              ; program length = VARTAB - TXTTAB
+            sbc       TXTTAB
+            sta       STO+STO_LEN_L
+            lda       VARTAB+1
+            sbc       TXTTAB+1
+            sta       STO+STO_LEN_H
+            lda       #STO_C_SAVE
+            jmp       sto_do
+
+; ---------------------------------------------------------------------------
+; LOAD "NAME"
+; ---------------------------------------------------------------------------
+sto_load:   jsr       sto_check
+            jsr       sto_getname
+            jsr       sto_clear
+            lda       #STO_TYPE_BAS
+            sta       STO+STO_TYPE
+            lda       TXTTAB              ; always load at the start of BASIC text
+            sta       STO+STO_ADDR_L
+            lda       TXTTAB+1
+            sta       STO+STO_ADDR_H
+            lda       #STO_F_ADDR
+            sta       STO+STO_FLAGS
+            lda       #STO_C_INFO         ; first ask how big it is ...
+            jsr       sto_do
+            clc                           ; ... and make sure it fits below HIMEM
+            lda       TXTTAB
+            adc       STO+STO_LEN_L
+            sta       sto_tmp
+            lda       TXTTAB+1
+            adc       STO+STO_LEN_H
+            cmp       MEMSIZ+1
+            bcc       @fits
+            bne       @full
+            lda       sto_tmp
+            cmp       MEMSIZ
+            bcc       @fits
+@full:      ldx       #ERR_MEMFULL
+            jmp       ERROR
+@fits:      lda       #STO_C_LOAD
+            jsr       sto_do
+            clc                           ; end of program = TXTTAB + length
+            lda       TXTTAB
+            adc       STO+STO_LEN_L
+            sta       VARTAB
+            lda       TXTTAB+1
+            adc       STO+STO_LEN_H
+            sta       VARTAB+1
+            jmp       FIX_LINKS           ; relink the lines, clear the variables, back to the prompt
+
+; ---------------------------------------------------------------------------
+; BLOAD "NAME"[,addr]
+; ---------------------------------------------------------------------------
+sto_bload:  jsr       sto_check
+            jsr       sto_getname
+            jsr       sto_clear
+            lda       #STO_TYPE_ANY
+            sta       STO+STO_TYPE
+            jsr       CHRGOT
+            cmp       #','
+            bne       @go
+            jsr       sto_getnum
+            lda       LINNUM
+            sta       STO+STO_ADDR_L
+            lda       LINNUM+1
+            sta       STO+STO_ADDR_H
+            lda       #STO_F_ADDR
+            sta       STO+STO_FLAGS
+@go:        lda       #STO_C_LOAD
+            jmp       sto_do
+
+; ---------------------------------------------------------------------------
+; BSAVE "NAME",addr,len[,exec]
+; ---------------------------------------------------------------------------
+sto_bsave:  jsr       sto_check
+            jsr       sto_getname
+            jsr       sto_clear
+            lda       #STO_TYPE_BIN
+            sta       STO+STO_TYPE
+            jsr       sto_getnum
+            lda       LINNUM
+            sta       STO+STO_ADDR_L
+            lda       LINNUM+1
+            sta       STO+STO_ADDR_H
+            jsr       sto_getnum
+            lda       LINNUM
+            sta       STO+STO_LEN_L
+            lda       LINNUM+1
+            sta       STO+STO_LEN_H
+            jsr       CHRGOT
+            cmp       #','
+            bne       @go
+            jsr       sto_getnum
+            lda       LINNUM
+            sta       STO+STO_EXEC_L
+            lda       LINNUM+1
+            sta       STO+STO_EXEC_H
+@go:        lda       #STO_C_SAVE
+            jmp       sto_do
+
+; ---------------------------------------------------------------------------
+; BRUN "NAME": load a binary at its own address and call it
+; ---------------------------------------------------------------------------
+sto_brun:   jsr       sto_check
+            jsr       sto_getname
+            jsr       sto_clear
+            lda       #STO_TYPE_ANY
+            sta       STO+STO_TYPE
+            lda       #STO_C_LOAD
+            jsr       sto_do
+            lda       STO+STO_EXEC_L      ; exec address 0 = start at the load address
+            ora       STO+STO_EXEC_H
+            bne       @run
+            lda       STO+STO_ADDR_L
+            sta       STO+STO_EXEC_L
+            lda       STO+STO_ADDR_H
+            sta       STO+STO_EXEC_H
+@run:       jmp       (STO+STO_EXEC_L)    ; the program ends with RTS to come back to BASIC
+
+; ---------------------------------------------------------------------------
+; ERASE "NAME"      RENAME "OLD","NEW"
+; ---------------------------------------------------------------------------
+sto_erase:  jsr       sto_check
+            jsr       sto_getname
+            jsr       sto_clear
+            lda       #STO_C_DELETE
+            jmp       sto_try
+
+sto_rename: jsr       sto_check
+            jsr       sto_getname
+            jsr       CHKCOM
+            jsr       sto_getname2
+            jsr       sto_clear
+            lda       #STO_C_RENAME
+            jmp       sto_try
+
+; ---------------------------------------------------------------------------
+; CATALOG
+; ---------------------------------------------------------------------------
+sto_catalog:
+            jsr       sto_check
+            lda       #0
+            sta       STO+STO_INDEX
+@next:      lda       #<sto_buf
+            sta       STO+STO_NAME_L
+            lda       #>sto_buf
+            sta       STO+STO_NAME_H
+            lda       #STO_C_DIRENT
+            jsr       sto_run
+            cmp       #STO_E_END
+            beq       @end
+            cmp       #0
+            beq       @show
+            jmp       sto_fail
+@show:      ldx       #0                  ; name, padded to 13 columns
+@name:      lda       sto_buf,x
+            beq       @pad
+            jsr       OUTDO
+            inx
+            bne       @name
+@pad:       cpx       #13
+            bcs       @type
+            jsr       OUTSP
+            inx
+            bne       @pad
+@type:      lda       STO+STO_TYPE        ; 0 BIN, 1 BAS, 2 TXT, anything else -> "???"
+            cmp       #3
+            bcc       @t1
+            lda       #3
+@t1:        sta       sto_tmp
+            asl
+            clc
+            adc       sto_tmp             ; index * 3 into sto_types
+            tax
+            ldy       #3
+@tl:        lda       sto_types,x
+            jsr       OUTDO
+            inx
+            dey
+            bne       @tl
+            jsr       OUTSP
+            jsr       OUTSP
+            lda       STO+STO_LEN_H       ; size (16 bit, 65535 for anything bigger)
+            ldx       STO+STO_LEN_L
+            jsr       LINPRT
+            jsr       CRDO
+            inc       STO+STO_INDEX
+            bne       @next               ; (at most 255 files listed)
+@end:       lda       #STO_C_FREE
+            jsr       sto_do
+            lda       STO+STO_LEN_H       ; number of files
+            ldx       STO+STO_LEN_L
+            jsr       LINPRT
+            lda       #<sto_txt_files
+            ldy       #>sto_txt_files
+            jsr       STROUT
+            lda       STO+STO_SIZE_1      ; free KB = size >> 10
+            lsr
+            lsr
+            sta       sto_tmp
+            lda       STO+STO_SIZE_2
+            and       #3
+            asl
+            asl
+            asl
+            asl
+            asl
+            asl
+            ora       sto_tmp
+            tax
+            lda       STO+STO_SIZE_2
+            lsr
+            lsr
+            jsr       LINPRT
+            lda       #<sto_txt_free
+            ldy       #>sto_txt_free
+            jsr       STROUT
+            jmp       CRDO
+
+sto_types:  .byte     "BINBASTXT???"
+sto_txt_files: .byte  " FILES, ", 0
+sto_txt_free: .byte   " KB FREE", 0
+
+; error messages: the last character of each has bit 7 set (as in ERROR_MESSAGES)
+sto_msgs:
+sm_ok:       .byte     "O", 'K'+128
+sm_nf:       .byte     "File not foun", 'd'+128
+sm_full:     .byte     "Disk ful", 'l'+128
+sm_name:     .byte     "Bad file nam", 'e'+128
+sm_type:     .byte     "File type mismatc", 'h'+128
+sm_io:       .byte     "Storage I/", 'O'+128
+sm_cmd:      .byte     "Bad storage comman", 'd'+128
+sm_end:      .byte     "End of director", 'y'+128
+sm_addr:     .byte     "Address rang", 'e'+128
+sm_exist:    .byte     "File exist", 's'+128
+sm_big:      .byte     "File too bi", 'g'+128
+sm_bad:      .byte     "File corrup", 't'+128
+sm_none:     .byte     "No storag", 'e'+128
+sto_msgofs: .byte     sm_ok-sto_msgs, sm_nf-sto_msgs, sm_full-sto_msgs, sm_name-sto_msgs, sm_type-sto_msgs
+            .byte     sm_io-sto_msgs, sm_cmd-sto_msgs, sm_end-sto_msgs, sm_addr-sto_msgs, sm_exist-sto_msgs
+            .byte     sm_big-sto_msgs, sm_bad-sto_msgs, sm_none-sto_msgs

@@ -1,0 +1,2019 @@
+; ============================================================================
+; Memory map. Everything below is relative to these two symbols: to move the
+; I/O page or the ROM change them here (and IO_START / ROM_START in
+; include/mapper.h, emulator/memmap.py).
+; ============================================================================
+IOBASE     =        $8000               ; I/O page (256 bytes, page aligned)
+ROMBASE    =        $8100               ; first ROM address (nothing is used below $C000 yet)
+BASICBASE  =        $C000               ; BASIC interpreter
+
+ledport    =        IOBASE+$00          ; LEDs (bits 0-2)
+keyb       =        IOBASE+$01          ; keyboard
+romctl     =        IOBASE+$04          ; ROM on/off: write 1 = ROM off (RAM), 0 = ROM on; read bit 7 = busy
+abrddat    =        IOBASE+$02          ; Read data from 9918
+abwrdat    =        IOBASE+$02          ; Write data to 9918
+abwrreg    =        IOBASE+$03          ; Write 9918 control registers (read = status)
+
+abpsgreg   =        IOBASE+$08          ; Write 8910 control registers
+abpsgdat   =        IOBASE+$09          ;       8910 i/o
+
+basadr     =        $06                 ; A pair of ZP addresses
+
+ch         =        $24
+cv         =        $25
+basl       =        $28
+bash       =        $29
+bas2l      =        $2A
+bas2h      =        $2B
+h2         =        $2C
+lmnem      =        $2C
+v2         =        $2D
+rmnem      =        $2D
+mask       =        $2E
+format     =        $2E
+length     =        $2F
+mode       =        $31
+invflg     =        $32
+prompt     =        $33
+ysav       =        $34
+ysav1      =        $35
+cswl       =        $36
+cswh       =        $37
+kswl       =        $38
+kswh       =        $39
+pcl        =        $3A
+pch        =        $3B
+a1l        =        $3C
+a1h        =        $3D
+a2l        =        $3E
+a2h        =        $3F
+a3l        =        $40
+a3h        =        $41
+a4l        =        $42
+a4h        =        $43
+a5l        =        $44
+a5h        =        $45
+macstat    =        $44
+acc        =        $45
+xreg       =        $46
+yreg       =        $47
+status     =        $48
+spnt       =        $49
+rndl       =        $4E
+rndh       =        $4F
+bootdev    =        $4F
+hcolor     =        $E4
+ingmod     =        $EA
+holda      =        $EB
+xoff       =        $EC
+yoff       =        $ED
+tach       =        $EE                 ; Controls the cursor speed
+csrphase   =        $EF
+csrlin     =        $FA
+tmpad1     =        $FC
+tmpad2     =        $FE
+
+in         =        $0200
+
+paddr      =        $0300
+pmask      =        $0302
+pacc       =        $0303
+px         =        $0304
+py         =        $0305
+pdata      =        $0306
+
+resvec     =        $03F2               ; User reset vector
+usradr     =        $03F8               ; User vector
+usrirq     =        $03FE               ; User IRQ vector
+
+
+; ============================================================================
+; VDP frame interrupt (VSYNC).  The Pico sets the VDP frame flag 60 times a
+; second; with bit 5 of VDP register 1 set it also pulls the CPU's /IRQ low
+; until $8003 is read.  Assemble with -D VSYNC_IRQ=0 to build the old ROM
+; (interrupt left off).  Free RAM used (BASIC: PEEK the decimal address):
+;   vblcount  $03E0-$03E2   992-994  frame counter, 24 bit, low byte first
+;   vdpflags  $03E3         995      VDP status bits collected since cleared:
+;                                    128 frame, 64 fifth sprite, 32 collision
+;   vbl_on    $03E4         996      non-zero: VDP 1,n keeps the interrupt bit
+; ============================================================================
+          .ifndef   VSYNC_IRQ
+VSYNC_IRQ  =        1
+          .endif
+          .ifndef   STORAGE               ; 1: SAVE/LOAD/BSAVE/BLOAD/BRUN/CATALOG/ERASE/RENAME on the flash storage
+STORAGE    =        1
+          .endif
+vblcount   =        $03E0
+vdpflags   =        $03E3
+vbl_on     =        $03E4
+vbl_linnum =        $50                 ; same as LINNUM in fpp65.a65
+
+          .pc02
+          .org      ROMBASE
+
+          .if       VSYNC_IRQ
+; ----------------------------------------------------------------------------
+; Cold start: set up the text mode (its register table has the interrupt bit
+; set), throw away a stale frame flag and enable interrupts.
+; ----------------------------------------------------------------------------
+vbl_init: lda       #$00
+          sta       vblcount
+          sta       vblcount+1
+          sta       vblcount+2
+          sta       vdpflags
+          lda       #$01
+          sta       vbl_on
+          jsr       initxt
+          lda       abwrreg             ; discard a stale frame flag
+          cli
+          rts
+
+; ----------------------------------------------------------------------------
+; Hardware IRQ handler (jumped to through usrirq by the monitor's irq: stub,
+; which has put A in acc and left X, Y alone).  The IRQ line is released a
+; little AFTER the status read, so this is sometimes entered again with the
+; frame flag clear: those entries are ignored.
+; ----------------------------------------------------------------------------
+vbl_irq:  lda       abwrreg             ; read + clear status, releases /IRQ
+          and       #$E0                ; frame, 5th sprite, collision
+          tsb       vdpflags            ; collect (TSB leaves N alone)
+          bpl       @done               ; frame flag clear: empty entry
+          inc       vblcount
+          bne       @done
+          inc       vblcount+1
+          bne       @done
+          inc       vblcount+2
+@done:    lda       acc                 ; the stub saved A here
+          rti
+
+; ----------------------------------------------------------------------------
+; Called by the BASIC VDP command in place of "stx abwrreg": keep the
+; interrupt bit when register 1 is written (unless POKE 996,0).
+; ----------------------------------------------------------------------------
+vbl_vdpdo: lda      vbl_linnum          ; register number
+          cmp       #$01
+          bne       @write
+          lda       vbl_on
+          beq       @write
+          txa
+          ora       #$20
+          tax
+@write:   stx       abwrreg
+          rts
+          .endif
+
+          .res      BASICBASE-*
+          .include  "fpp65.a65"
+          .if       STORAGE
+          .include  "storage.a65"         ; fits into the gap between BASIC and the monitor
+          .endif
+          .res      $F000-*
+          
+font:     .byte     $00, $00, $00, $00, $00, $00, $00, $00
+          .byte     $E0, $E0, $E0, $E0, $00, $00, $00, $00
+          .byte     $1C, $1C, $1C, $1C, $00, $00, $00, $00
+          .byte     $FC, $FC, $FC, $FC, $00, $00, $00, $00
+          .byte     $00, $00, $00, $00, $E0, $E0, $E0, $E0
+          .byte     $E0, $E0, $E0, $E0, $E0, $E0, $E0, $E0
+          .byte     $1C, $1C, $1C, $1C, $E0, $E0, $E0, $E0
+          .byte     $FC, $FC, $FC, $FC, $E0, $E0, $E0, $E0
+          .byte     $00, $00, $00, $00, $1C, $1C, $1C, $1C
+          .byte     $E0, $E0, $E0, $E0, $1C, $1C, $1C, $1C
+          .byte     $1C, $1C, $1C, $1C, $1C, $1C, $1C, $1C
+          .byte     $FC, $FC, $FC, $FC, $1C, $1C, $1C, $1C
+          .byte     $00, $00, $00, $00, $FC, $FC, $FC, $FC
+          .byte     $E0, $E0, $E0, $E0, $FC, $FC, $FC, $FC
+          .byte     $1C, $1C, $1C, $1C, $FC, $FC, $FC, $FC
+          .byte     $FC, $FC, $FC, $FC, $FC, $FC, $FC, $FC
+          .byte     $00, $00, $00, $3C, $20, $20, $20, $20
+          .byte     $00, $00, $00, $FC, $20, $20, $20, $20
+          .byte     $00, $00, $00, $E0, $20, $20, $20, $20
+          .byte     $20, $20, $20, $20, $20, $20, $20, $20
+          .byte     $20, $20, $20, $3C, $20, $20, $20, $20
+          .byte     $20, $20, $20, $FC, $20, $20, $20, $20
+          .byte     $20, $20, $20, $E0, $20, $20, $20, $20
+          .byte     $20, $20, $20, $3C, $00, $00, $00, $00
+          .byte     $20, $20, $20, $FC, $00, $00, $00, $00
+          .byte     $20, $20, $20, $E0, $00, $00, $00, $00
+          .byte     $00, $00, $00, $FC, $00, $00, $00, $00
+          .byte     $00, $00, $70, $70, $70, $00, $00, $00
+          .byte     $20, $70, $A8, $20, $20, $20, $20, $00
+          .byte     $20, $20, $20, $20, $A8, $70, $20, $00
+          .byte     $00, $20, $40, $F8, $40, $20, $00, $00
+          .byte     $00, $20, $10, $F8, $10, $20, $00, $00
+          .byte     $00, $00, $00, $00, $00, $00, $00, $00
+          .byte     $20, $20, $20, $20, $20, $00, $20, $00
+          .byte     $50, $50, $50, $00, $00, $00, $00, $00
+          .byte     $50, $50, $F8, $50, $F8, $50, $50, $00
+          .byte     $20, $70, $80, $70, $08, $70, $20, $00
+          .byte     $00, $88, $10, $20, $40, $88, $00, $00
+          .byte     $40, $A0, $A0, $48, $B0, $90, $68, $00
+          .byte     $20, $20, $40, $00, $00, $00, $00, $00
+          .byte     $10, $20, $40, $40, $40, $20, $10, $00
+          .byte     $40, $20, $10, $10, $10, $20, $40, $00
+          .byte     $20, $A8, $70, $20, $70, $A8, $20, $00
+          .byte     $00, $20, $20, $F8, $20, $20, $00, $00
+          .byte     $00, $00, $00, $00, $00, $20, $20, $40
+          .byte     $00, $00, $00, $70, $00, $00, $00, $00
+          .byte     $00, $00, $00, $00, $00, $00, $20, $00
+          .byte     $00, $00, $08, $10, $20, $40, $80, $00
+          .byte     $70, $88, $98, $A8, $C8, $88, $70, $00
+          .byte     $20, $60, $20, $20, $20, $20, $70, $00
+          .byte     $70, $88, $08, $30, $40, $80, $F8, $00
+          .byte     $70, $88, $08, $30, $08, $88, $70, $00
+          .byte     $10, $30, $50, $90, $F8, $10, $10, $00
+          .byte     $F8, $80, $F0, $08, $08, $88, $70, $00
+          .byte     $30, $40, $80, $F0, $88, $88, $70, $00
+          .byte     $F8, $08, $10, $20, $40, $40, $40, $00
+          .byte     $70, $88, $88, $70, $88, $88, $70, $00
+          .byte     $70, $88, $88, $78, $08, $10, $60, $00
+          .byte     $00, $00, $00, $20, $00, $20, $00, $00
+          .byte     $00, $00, $00, $20, $00, $20, $20, $40
+          .byte     $10, $20, $40, $80, $40, $20, $10, $00
+          .byte     $00, $00, $00, $F8, $00, $F8, $00, $00
+          .byte     $80, $40, $20, $10, $20, $40, $80, $00
+          .byte     $70, $88, $10, $20, $20, $00, $20, $00
+          .byte     $70, $88, $88, $B8, $B8, $80, $70, $00
+          .byte     $20, $50, $88, $88, $F8, $88, $88, $00
+          .byte     $F0, $88, $88, $F0, $88, $88, $F0, $00
+          .byte     $70, $88, $80, $80, $80, $88, $70, $00
+          .byte     $F0, $88, $88, $88, $88, $88, $F0, $00
+          .byte     $F8, $80, $80, $F0, $80, $80, $F8, $00
+          .byte     $F8, $80, $80, $F0, $80, $80, $80, $00
+          .byte     $70, $88, $80, $98, $88, $88, $78, $00
+          .byte     $88, $88, $88, $F8, $88, $88, $88, $00
+          .byte     $70, $20, $20, $20, $20, $20, $70, $00
+          .byte     $08, $08, $08, $08, $88, $88, $70, $00
+          .byte     $88, $90, $A0, $C0, $A0, $90, $88, $00
+          .byte     $80, $80, $80, $80, $80, $80, $F8, $00
+          .byte     $88, $D8, $A8, $A8, $88, $88, $88, $00
+          .byte     $88, $88, $C8, $A8, $98, $88, $88, $00
+          .byte     $70, $88, $88, $88, $88, $88, $70, $00
+          .byte     $F0, $88, $88, $F0, $80, $80, $80, $00
+          .byte     $70, $88, $88, $88, $88, $90, $68, $00
+          .byte     $F0, $88, $88, $F0, $A0, $90, $88, $00
+          .byte     $70, $88, $80, $70, $08, $88, $70, $00
+          .byte     $F8, $20, $20, $20, $20, $20, $20, $00
+          .byte     $88, $88, $88, $88, $88, $88, $70, $00
+          .byte     $88, $88, $88, $88, $88, $50, $20, $00
+          .byte     $88, $88, $88, $A8, $A8, $D8, $88, $00
+          .byte     $88, $88, $50, $20, $50, $88, $88, $00
+          .byte     $88, $88, $88, $50, $20, $20, $20, $00
+          .byte     $F8, $08, $10, $20, $40, $80, $F8, $00
+          .byte     $70, $40, $40, $40, $40, $40, $70, $00
+          .byte     $00, $00, $80, $40, $20, $10, $08, $00
+          .byte     $70, $10, $10, $10, $10, $10, $70, $00
+          .byte     $20, $50, $88, $00, $00, $00, $00, $00
+          .byte     $00, $00, $00, $00, $00, $00, $00, $FC
+          .byte     $40, $20, $10, $00, $00, $00, $00, $00
+          .byte     $00, $00, $70, $08, $78, $88, $78, $00
+          .byte     $80, $80, $B0, $C8, $88, $88, $F0, $00
+          .byte     $00, $00, $70, $88, $80, $88, $70, $00
+          .byte     $08, $08, $68, $98, $88, $88, $78, $00
+          .byte     $00, $00, $70, $88, $F8, $80, $78, $00
+          .byte     $30, $48, $40, $E0, $40, $40, $40, $00
+          .byte     $00, $00, $78, $88, $88, $78, $08, $70
+          .byte     $80, $80, $B0, $C8, $88, $88, $88, $00
+          .byte     $20, $00, $60, $20, $20, $20, $20, $00
+          .byte     $08, $00, $18, $08, $08, $08, $88, $70
+          .byte     $80, $80, $88, $90, $E0, $90, $88, $00
+          .byte     $60, $20, $20, $20, $20, $20, $20, $00
+          .byte     $00, $00, $88, $D8, $A8, $88, $88, $00
+          .byte     $00, $00, $70, $88, $88, $88, $88, $00
+          .byte     $00, $00, $70, $88, $88, $88, $70, $00
+          .byte     $00, $00, $B0, $C8, $88, $F0, $80, $80
+          .byte     $00, $00, $68, $98, $88, $78, $08, $08
+          .byte     $00, $00, $70, $88, $80, $80, $80, $00
+          .byte     $00, $00, $78, $80, $70, $08, $F0, $00
+          .byte     $40, $40, $E0, $40, $40, $48, $30, $00
+          .byte     $00, $00, $88, $88, $88, $98, $68, $00
+          .byte     $00, $00, $88, $88, $88, $50, $20, $00
+          .byte     $00, $00, $88, $88, $A8, $D8, $88, $00
+          .byte     $00, $00, $88, $50, $20, $50, $88, $00
+          .byte     $00, $00, $88, $88, $88, $78, $08, $70
+          .byte     $00, $00, $F8, $10, $20, $40, $F8, $00
+          .byte     $30, $40, $40, $80, $40, $40, $30, $00
+          .byte     $20, $20, $20, $00, $20, $20, $20, $00
+          .byte     $60, $10, $10, $08, $10, $10, $60, $00
+          .byte     $68, $B0, $00, $00, $00, $00, $00, $00
+          .byte     $00, $A8, $50, $A8, $50, $A8, $00, $00
+
+m_banner: .byte     "P65 24030508", 13, 0
+
+entry:    lda       #<getch             ; Input vector
+          sta       $38
+          lda       #>getch
+          sta       $39
+          .if       VSYNC_IRQ
+          lda       #<vbl_irq
+          sta       usrirq
+          lda       #>vbl_irq
+          sta       usrirq+1
+          jsr       vbl_init            ; initxt + enable the frame interrupt
+          .else
+          lda       #<break
+          sta       usrirq
+          lda       #>break
+          sta       usrirq+1
+          jsr       initxt
+          .endif
+          jsr       setnorm
+          lda       resvec+1
+          eor       #$A5
+          cmp       resvec+2
+          beq       @1
+          jsr       banner
+          jmp       xbasic
+@1:       jsr       home
+          jmp       (resvec)
+
+banner:   ldy       #$00
+@1:       lda       m_banner, y
+          beq       @2
+          eor       #$80
+          jsr       cout
+          iny
+          bne       @1
+@2:       rts
+
+iniany:   lda       #$00
+          sta       abwrreg
+          sta       abwrreg
+          ldx       #$80
+@1:       lda       txtregs, y
+          sta       abwrreg
+          stx       abwrreg
+          inx
+          iny
+          sta       $30                 ; Will ultimately hold the color
+          tya                           ; What we're comparing to may vary,
+          and       #$07                ;   but it will always be a multiple
+          bne       @1                  ;   of 8, so check that way
+          lda       #$00                ; Now flush memory
+          tax                           ; Zero all 6502 regs
+          tay
+          sta       abwrreg
+          lda       #$40                ; Write $0000
+          sta       abwrreg
+          tya
+@2:       sta       abwrdat             ; Zoom zoom zoom
+          iny
+          bne       @2
+          inx
+          cpx       #$40                ; Reached 16K yet?
+          bcc       @2                  ; No, keep going
+          rts
+
+initxt:   lda       #$00
+          sta       ingmod
+          lda       #<putch             ; Output vector
+          sta       $36
+          lda       #>putch
+          sta       $37
+          ldy       #$00
+          jsr       iniany
+          lda       #<font
+          sta       basadr
+          lda       #>font
+          sta       basadr+1
+          lda       #$00                ; $0000 ($4000)
+          sta       abwrreg
+          lda       #$40
+          sta       abwrreg
+          ldy       #$00
+          ldx       #$04                ; Copy 4*256 bytes, inverted
+@3:       lda       (basadr), y
+          eor       #$FF
+          sta       abwrdat
+          iny                           ; Zoom zoom zoom
+          bne       @3
+          inc       basadr+1
+          dex
+          bne       @3
+          lda       #>font
+          sta       basadr+1
+          ldx       #$04                ; Do it again, uninverted
+@4:       lda       (basadr), y
+          sta       abwrdat
+          iny                           ; Zoom zoom zoom
+          bne       @4
+          inc       basadr+1
+          dex
+          bne       @4                  ; FALL INTO
+home:     lda       ingmod
+          beq       @1
+          jmp       hhome
+@1:       lda       #$00
+          sta       abwrreg
+          lda       #$48                ; Write $0800
+          sta       abwrreg
+          lda       #' '+$80
+          ldy       #$00
+@2:       sta       abwrdat             ; 3 passes of 256 bytes & 1 of 192
+          sta       abwrdat
+          sta       abwrdat
+          iny
+          bne       @2
+          ldy       #$40
+@3:       sta       abwrdat
+          iny
+          bne       @3
+          ldx       #$00
+          stx       xoff                ; FALL INTO
+vtab:     stx       yoff
+          txa
+          clc
+          asl
+          tay
+          lda       linlut, y
+          sta       csrlin
+          lda       linlut+1, y
+          sta       csrlin+1
+          rts
+
+htab:     stx       xoff
+          rts
+
+bell:     tya
+          pha
+          txa
+          pha
+          
+          lda       #$07
+          sta       abpsgreg
+          lda       #$3E                ; Output channel A
+          sta       abpsgdat
+          lda       #$00
+          sta       abpsgreg
+          lda       #$48                ; Tone
+          sta       abpsgdat
+          lda       #$01
+          sta       abpsgreg
+          lda       #$00
+          sta       abpsgdat
+          lda       #$08
+          sta       abpsgreg
+          lda       #$0F                ; Volume max
+          sta       abpsgdat
+          ldx       #$80
+          ldy       #$00
+@1:       inx
+          bne       @1
+          ldx       #$80
+          iny
+          bne       @1
+          lda       #$08
+          sta       abpsgreg
+          lda       #$00
+          sta       abpsgdat
+          pla
+          tax
+          pla
+          tay
+          rts
+
+putch:    sta       holda               ; Save argument
+          txa                           ; Save regs on stack
+          pha
+          tya
+          pha
+          
+          lda       holda               ; Printable?
+          
+          cmp       #$80
+          bcc       doputch
+          cmp       #$A0
+          bcs       doputch
+          
+          cmp       #$87                ; ^G bell
+          beq       dobel
+          cmp       #$88                ; ^H backspace
+          beq       dobs
+          cmp       #$8A                ; ^J linefeed
+          beq       dolf
+          cmp       #$8C                ; ^L formfeed
+          beq       dohome
+          cmp       #$8D                ; ^M carriage return
+          beq       docr
+          cmp       #$8E                ; ^N normal
+          beq       donrm
+          cmp       #$8F                ; ^O inverse
+          beq       doinv
+          cmp       #$93                ; ^S Special
+          beq       dospc
+          cmp       #$99                ; ^Y home
+          beq       dohom
+          cmp       #$9F                ; ^_ line backfeed
+          beq       dounlf
+          bne       endputch            ; ALWAYS
+
+doinv:    jsr       setinv
+          bra       endputch
+donrm:    jsr       setnorm
+          bra       endputch
+dospc:    jsr       setspec
+          bra       endputch
+dohom:    ldx       #$00
+          stx       xoff
+          beq       dovtab              ; ALWAYS
+dounlf:   ldx       yoff
+          beq       endputch
+          dex
+dovtab:   jsr       vtab
+          bra       endputch
+
+doputch:  clc                           ; Get the address in vram
+          lda       xoff
+          tax
+          adc       csrlin
+          sta       abwrreg             ; Pump out low byte
+          lda       #$00
+          adc       csrlin+1
+          sta       abwrreg             ; Then high byte
+          clc
+          lda       holda               ; Get our char back
+          and       $32                 ; Mask it (mostly like the normal screen)
+                                        ; NOTE: POKE 50,127 for INVERSE!
+                                        ;       NORMAL, POKE 50,255 work too
+          sta       abwrdat             ; Write it
+          inx                           ; Update the X position
+          stx       xoff
+          cpx       #$28                ; At end of line?
+          bcc       endputch            ; No
+          jsr       cr
+endputch: pla                           ; Restore registers
+          tay
+          pla
+          tax
+          lda       holda
+          rts
+
+dobel:    jsr       bell
+          bra       endputch
+dobs:     jsr       bs
+          bra       endputch
+docr:     jsr       cr
+          bra       endputch
+dolf:     jsr       lf
+          bra       endputch
+dohome:   jsr       home
+          bra       endputch
+
+bs:       ldx       xoff                ; Take our X position
+          dex                           ; Lower it
+          bpl       @2                  ; Didn't roll over, skip
+          ldx       #$27                ; Do an HTAB 40 and then move up one line
+          stx       xoff
+          ldx       yoff
+          beq       @1                  ; Already on the top of the screen, skip
+          dex                           ; Move up a line
+          jmp       vtab
+@1:       rts
+@2:       stx       xoff                ; Just save our position and get out of dodge
+          rts
+
+cr:       ldx       #$00                ; Do an HTAB 1 and fall through
+          stx       xoff
+lf:       ldx       yoff                ; What line are we on?
+          inx
+          cpx       #$18                ; End of screen?
+          bcc       @1                  ; No, so do a vtab.
+          jsr       scroll              ; Yes, so leave the Y pos alone & push up a line
+          rts
+@1:       jmp       vtab
+
+getch:    txa                           ; Save regs on stack
+          pha
+          tya
+          pha
+          bit       ingmod              ; Graphics mode?
+          beq       @1                  ; No, skip
+          jmp       hgetch
+@1:       clc                           ; Determine where in VRAM to place the cursor
+          lda       xoff                ;   and set the 9918 read pointer
+          adc       csrlin
+          sta       tmpad1
+          sta       abwrreg
+          lda       #$00
+          adc       csrlin+1
+          and       #$3F                ; Read
+          sta       tmpad1+1
+          sta       abwrreg
+          lda       abrddat             ; What's there already?
+          sta       tmpad2              ; Save it
+@2:       lda       tmpad1              ; Set the 9918 write pointer
+          sta       abwrreg
+          lda       tmpad1+1
+          ora       #$40                ; Write
+          sta       abwrreg
+          lda       tmpad2              ; Retrieve char under cursor
+          ldy       csrphase            ; Show or hide cursor?
+          bmi       @4                  ; >=128: toggle it
+          beq       @3                  ; 0 or 1 sets it
+          ora       #$80                ; 1 - force highlight off
+          .byte     $2C                 ; Skip next op
+@3:       and       #$7F                ; 0 - force highlight on
+          .byte     $2C                 ; Skip next op
+@4:       eor       #$80                ; 128+ - force highlight toggle
+          sta       abwrdat             ; Put it back
+@5:       inx
+          bne       @6
+          inc       tach
+          bne       @6
+          lda       #$01
+          eor       csrphase
+          sta       csrphase
+          jmp       @2
+@6:       lda       keyb                ; Key waiting?
+          bpl       @5                  ; No key, keep going
+          sta       keyb                ; Unflag strobe
+          sta       tmpad2+1            ; Save the key
+          lda       tmpad1              ; Reset the write register
+          sta       abwrreg
+          lda       tmpad1+1
+          ora       #$40                ; Write
+          sta       abwrreg
+          lda       tmpad2              ; Erase cursor by rewriting orig char
+          sta       abwrdat
+          pla                           ; Restore X & Y regs
+          tay
+          pla
+          tax
+          lda       tmpad2+1            ; Retrieve the key that was pressed
+          rts
+
+scroll:   lda       #$28                ; This is a simple memory move
+          sta       tmpad1              ;   that looks more baroque than it is
+          lda       #$08                ;   (slide from 0828.0BBF up to 0800)
+          sta       tmpad1+1
+          lda       #$00
+          sta       tmpad2
+          lda       #$48
+          sta       tmpad2+1
+@1:       lda       tmpad1              ; Set read pointer
+          sta       abwrreg
+          lda       tmpad1+1
+          sta       abwrreg
+          ldx       abrddat             ; Get byte
+          lda       tmpad2              ; Set write pointer
+          sta       abwrreg
+          lda       tmpad2+1
+          sta       abwrreg
+          stx       abwrdat             ; Put byte
+          inc       tmpad1
+          bne       @2                  ; Wrap
+          inc       tmpad1+1
+@2:       inc       tmpad2
+          bne       @3                  ; Wrap
+          inc       tmpad2+1
+@3:       lda       tmpad2              ; Are we done yet? (write addr is 4B98)
+          cmp       #$98
+          bne       @1                  ; Keep going
+          lda       tmpad2+1
+          cmp       #$4B
+          bne       @1                  ; Keep going
+          lda       #' '+$80            ; Quickly write row of spaces
+          ldy       #$28                ;   across the bottom
+@4:       sta       abwrdat
+          dey
+          bne       @4
+          rts                           ; Done like dinner
+
+irq:      sta       acc
+          pla
+          pha
+          asl
+          asl
+          asl
+          bmi       guru
+          jmp       (usrirq)
+guru:     plp
+          jsr       sav1
+          pla
+          sta       pcl
+          pla
+          sta       pcl+1
+break:    jsr       insds1              ; Print user instruction pointer
+          jsr       rgdsp1              ;   and registers
+mon:      cld                           ; Disable BCD mode
+          jsr       bell
+monz:     lda       #'*'+$80            ; * prompt for monitor
+          sta       prompt
+          jsr       getlnz              ; Read a line of input
+          jsr       zmode               ; Clear monitor mode, scan index
+nxtitm:   jsr       getnum              ; Get item,
+          sty       ysav                ;   non-hex char in accumulator
+          ldy       #(subtbl-chrtbl)    ; X=0 if no hex input.
+chrsrch:  dey
+          bmi       mon                 ; Command not found; beep and retry.
+          cmp       chrtbl, y           ; Find command char. in table
+          bne       chrsrch             ; Nope
+          jsr       tosub               ; Got it; call corresponding routine
+          ldy       ysav                ; Process next entry
+          jmp       nxtitm
+
+tosub:    lda       subtbl2, y          ; Dispatch to subroutine by pushing
+          pha                           ; its address onto the stack
+          lda       subtbl, y
+          pha
+          lda       mode                ; Clear mode, but store it
+zmode:    ldy       #$00                ;   in the accumulator
+          sty       mode
+          rts                           ; Fall into subroutine via RTS
+
+chrtbl:   .byte     $BC                 ; '^C'    (BASIC warm start)
+          .byte     $B2                 ; '^Y'    (user vector)
+          .byte     $BE                 ; '^E'    (open and display registers)
+          .byte     $9A                 ; '!'     (miniasm)
+          .byte     $EF                 ; 'V'     (memory verify)
+          .byte     $C4                 ; '^K'    (IN# slot)
+          .byte     $A9                 ; '^P'    (PR# slot)
+          .byte     $BB                 ; '^B'    (BASIC cold start)
+          .byte     $A6                 ; '-'     (subtraction)
+          .byte     $A4                 ; '+'     (addition)
+          .byte     $06                 ; 'M'     (memory move)
+          .byte     $95                 ; '<'     (delimiter for move/verify)
+          .byte     $07                 ; 'N'     (set normal video)
+          .byte     $02                 ; 'I'     (set inverse video)
+          .byte     $05                 ; 'L'     (disassemble 20 instrs.)
+          .byte     $00                 ; 'G'     (execute program)
+          .byte     $93                 ; ':'     (memory fill)
+          .byte     $A7                 ; '.'     (address delimiter)
+          .byte     $C6                 ; <Enter> (end of input)
+          .byte     $99                 ; Blank
+
+subtbl:   .byte     <(bascont-1)
+          .byte     <(usr-1)
+          .byte     <(regz-1)
+          .byte     <(mini-1)
+          .byte     <(verify-1)
+          .byte     <(inprt-1)
+          .byte     <(outprt-1)
+          .byte     <(xbasic-1)
+          .byte     <(setmode-1)
+          .byte     <(setmode-1)
+          .byte     <(move-1)
+          .byte     <(lt-1)
+          .byte     <(setnorm-1)
+          .byte     <(setinv-1)
+          .byte     <(list-1)
+          .byte     <(go-1)
+          .byte     <(setmode-1)
+          .byte     <(setmode-1)
+          .byte     <(crmon-1)
+          .byte     <(blank-1)
+
+subtbl2:  .byte     >(bascont-1)
+          .byte     >(usr-1)
+          .byte     >(regz-1)
+          .byte     >(mini-1)
+          .byte     >(verify-1)
+          .byte     >(inprt-1)
+          .byte     >(outprt-1)
+          .byte     >(xbasic-1)
+          .byte     >(setmode-1)
+          .byte     >(setmode-1)
+          .byte     >(move-1)
+          .byte     >(lt-1)
+          .byte     >(setnorm-1)
+          .byte     >(setinv-1)
+          .byte     >(list-1)
+          .byte     >(go-1)
+          .byte     >(setmode-1)
+          .byte     >(setmode-1)
+          .byte     >(crmon-1)
+          .byte     >(blank-1)
+
+mini:     jmp       getinst1
+
+gethex:   adc       #$88
+          cmp       #$FA
+          bcs       dig
+          rts
+dig:      ldx       #$03
+          asl
+          asl                           ; Got hex digit, shift into A2
+          asl
+          asl
+nxtbit:   asl
+          rol       a2l
+          rol       a2h
+          dex                           ; Leave X=$FF if digit
+          bpl       nxtbit
+nxtbas:   lda       mode
+          bne       nxtbs2              ; If mode is zero, copy A2 to A1, A3
+          lda       a2h, x
+          sta       a1h, x
+          sta       a3h, x
+nxtbs2:   inx
+          beq       nxtbas
+          bne       nxtchr              ; ALWAYS
+getnum:   ldx       #$00                ; Clear A2
+          stx       a2l
+          stx       a2h
+nxtchr:   lda       in, y               ; Get char
+          iny
+          jsr       upshift0            ; Upshift if necessary (set high bit)
+          eor       #'0'+$80
+          cmp       #$0A
+          bcc       dig                 ; It's a digit
+          bcs       gethex              ; Check for other digits (ALWAYS)
+
+upshift0: ora       #$80
+upshift:  cmp       #'z'+$81
+          bcs       @1
+          cmp       #'a'+$80
+          bcc       @1
+          and       #$DF
+@1:       rts
+
+notcr:    jsr       cout
+          cmp       #$88                ; Check for edit keys
+          beq       bckspc
+          cmp       #$98                ; Ctrl-X
+          beq       cancel
+          cpx       #$F8                ; Margin?
+          bcc       notcr1
+          jsr       bell                ; Sound bell
+notcr1:   inx                           ; Advance input index
+          bne       nxtchar
+cancel:   lda       #$DC
+          jsr       cout
+getlnz:   jsr       crout
+getln:    lda       prompt
+          jsr       cout
+          ldx       #$01
+bckspc:   txa
+          beq       getlnz
+          dex
+nxtchar:  jsr       rdkey
+          cmp       #$95                ; Ctrl-U
+          bne       captst
+          jsr       pick                ; Read char under cursor
+captst:   cmp       #$9B                ; ESC
+          beq       doesc
+          sta       in, x
+          cmp       #$8D
+          bne       notcr
+          jsr       cleanup
+
+crout:    lda       #$8D
+          jmp       cout
+
+doesc:    bit       ingmod              ; disable this in graphics mode
+          bne       @1
+          jsr       esc
+@1:       bra       nxtchar
+
+bascont:  jmp       $C003
+usr:      jmp       usradr              ; Jump to Ctrl-Y vector in RAM
+regz:     jmp       regdsp              ; Go display registers
+verify:   lda       (a1l), y            ; Verify (A1) through (A2) with (A4)
+          cmp       (a4l), y
+          beq       vfyok
+          jsr       pra1
+          lda       (a1l), y
+          jsr       prbyte
+          lda       #' '+$80
+          jsr       cout
+          lda       #'('+$80
+          jsr       cout
+          lda       (a4l), y
+          jsr       prbyte
+          lda       #')'+$80
+          jsr       cout
+vfyok:    jsr       nxta4
+          bcc       verify
+          rts
+inprt:    rts
+outprt:   rts
+xbasic:   jmp       $C000
+setmode:  ldy       ysav                ; Save converted ':', '+', '-', '.'
+          lda       in-1, y             ;   as mode
+setmdz:   sta       mode
+          rts
+move:     lda       (a1l), y            ; Move (A1) through (A2) to (A4)
+          sta       (a4l), y
+          jsr       nxta4
+          bcc       move
+          rts
+lt:       ldx       #$01
+lt2:      lda       a2l, x              ; Copy A2 (word) to A4 and A5
+          sta       a4l, x
+          sta       a5l, x
+          dex
+          bpl       lt2
+          rts
+a1pc:     txa                           ; If user specified address,
+          beq       a1pcrts             ;   copy from A1 to PC.
+a1pclp:   lda       a1l, x
+          sta       pcl, x
+          dex
+          bpl       a1pclp
+a1pcrts:  rts
+setnorm:  lda       #$FF
+          .byte     $2C
+setinv:   lda       #$7F
+          .byte     $2C
+setspec:  lda       #$BF
+          sta       invflg
+          rts
+list:     jsr       a1pc                ; Move A1 (word) to PC if specified
+          lda       #$14                ;   and disassemble 20 instructions.
+list2:    pha
+          jsr       instdsp
+          jsr       pcadj               ; Adjust instruction pointer each time
+          sta       pcl
+          sty       pch
+          pla
+          sec
+          sbc       #$01                ; Next instruction
+          bne       list2
+          rts
+go:       jsr       a1pc                ; Address to PC if specified
+          jsr       restore             ; Restore fake registers
+          jmp       (pcl)               ; Do it, maggot
+crmon:    jsr       bl1                 ; Handle <Enter> as blank
+          pla                           ; Pop stack
+          pla
+          jmp       monz                ; Return to monitor (ALWAYS)
+
+bl1:      dec       ysav
+          beq       xam8
+blank:    dex                           ; Blank to monitor
+          bne       setmdz              ; After blank
+          cmp       #$BA                ; Data store mode?
+          bne       xampm               ; No; examine, add or subtract
+stor:     sta       mode                ; Keep in store mode
+          lda       a2l
+          sta       (a3l), y            ; Store as low byte at (A3)
+          inc       a3l
+          bne       rts5
+          inc       a3h
+rts5:     rts
+
+pra1:     ldy       a1h                 ; Print CR, A1 in hex
+          ldx       a1l
+pryx2:    jsr       crout
+          jsr       prntyx
+          ldy       #$00
+          lda       #'-'+$80
+          jmp       cout
+
+xam8:     lda       a1l
+          ora       #$07                ; Set to finish at mod 8=7
+          sta       a2l
+          lda       a1h
+          sta       a2h
+mod8chk:  lda       a1l
+          and       #$07
+          bne       dataout
+xam:      jsr       pra1
+dataout:  lda       #' '+$80
+          jsr       cout
+          lda       (a1l), y
+          jsr       prbyte
+          jsr       nxta1
+          bcc       mod8chk
+rtc4c:    rts
+
+xampm:    lsr                           ; Determine if monitor mode is
+          bcc       xam                 ;   examine, add, or subtract
+          lsr
+          lsr
+          lda       a2l
+          bcc       add
+          eor       #$FF
+add:      adc       a1l
+          pha
+          lda       #'='+$80
+          jsr       cout
+          pla
+
+prbyte:   pha                           ; Print byte as two hex digits
+          lsr                           ;   (Destroys accumulator)
+          lsr
+          lsr
+          lsr
+          jsr       prhexz
+          pla
+
+prhex:    and       #$0F
+prhexz:   ora       #'0'+$80
+          cmp       #'9'+$81
+          bcc       cout
+          adc       #$06
+cout:     jmp       (cswl)
+
+rdkey:    ldy       ch                  ; Get char at current position
+          lda       (basl), y           ;   for those who restore it
+keyin0:   jmp       (kswl)              ; Go to user key-in
+
+nxta4:    inc       a4l                 ; Increment word A4 and A1
+          bne       nxta1
+          inc       a4h
+nxta1:    lda       a1l                 ; Increment A1
+          cmp       a2l
+          lda       a1h                 ; Compare to A2, carry if >=
+          sbc       a2h
+          inc       a1l
+          bne       rts4b
+          inc       a1h
+rts4b:    rts
+
+insds1:   ldx       pcl                 ; Print PCL,H
+          ldy       pch
+          jsr       pryx2
+          jsr       prblnk              ; Followed by a blank
+          lda       (pcl,x)             ; Get opcode
+insds2:   tay
+          lsr                           ; Even/odd test
+          bcc       ieven
+          ror                           ; Bit 1 test
+          bcs       err                 ; XXXXXX11 invalid op
+          and       #$87                ; Mask bits
+ieven:    lsr                           ; LSB into carry for L/R test
+          tax
+          lda       fmt1, x             ; Get format index byte
+          bcc       rtmskz              ; If even, use lower nibble
+          lsr
+          lsr
+          lsr                           ; Shift high nibble down
+          lsr
+rtmskz:   and       #$0F                ; Mask nibble
+          bne       getfmt
+err:      ldy       #$FC                ; Substitute $FC for invalid ops
+          lda       #$00                ; Set print format index to 0
+getfmt:   tax
+          lda       fmt2, x             ; Index into print format table
+          sta       format              ; Save for address field formatting
+          and       #$03                ; Mask for 2-bit length
+                                        ;   (0=1 byte, 1=2 byte, 2=3 byte)
+          sta       length
+          jsr       newops              ; Get index for new opcodes
+          beq       gotone              ; Found a new op (or NOP)
+          and       #$8F                ; Mask for 1XXX1010 test
+          tax                           ; Save it
+          tya                           ; Opcode to A again
+          ldy       #$03
+          cpx       #$8A
+          beq       mnndx3
+mnndx1:   lsr
+          bcc       mnndx3              ; Form index into mnemonic table
+          lsr
+mnndx2:   lsr                           ; 1) 1XXX1010->00101XXX
+          ora       #$20                ; 2) XXXYYY01->00111XXX
+          dey                           ; 3) XXXYYY10->00110XXX
+          bne       mnndx2              ; 4) XXXYY100->00100XXX
+          iny                           ; 5) XXXXX000->000XXXXX
+mnndx3:   dey
+          bne       mnndx1
+gotone:   rts
+
+restore:  lda       status              ; Restore 65C02 register contents
+          pha                           ;   used by debugger
+          lda       a5h
+restr1:   ldx       xreg
+          ldy       yreg
+          plp
+          rts
+
+save:     sta       a5h                 ; Save 65C02 register contents
+sav1:     stx       xreg                ;   for debugger
+          sty       yreg
+          php
+          pla
+          sta       status
+          tsx
+          stx       spnt
+          cld
+iorts:    rts                           ; A neutral RTS; used for PIC
+
+; =============================================================================
+; NEWOPS translates the opcode in Y to a mnemonic table index and returns Z=1.
+; If Y is not a new opcode, Z=0.
+; =============================================================================
+
+newops:   tya                           ; Get opcode
+          ldx       #numops             ; Scan through new opcodes
+newop1:   cmp       optbl, x            ; Match?
+          beq       getindx             ; Yes; get new index
+          dex
+          bpl       newop1              ; Keep scanning
+          rts                           ; Fail; exit with NE
+
+getindx:  lda       indx, x             ; Mnemonic lookup index
+          ldy       #$00                ; Sets Z
+crrts:    rts
+
+instdsp:  jsr       insds1              ; Generate format/length bytes
+          pha                           ; Save mnemonic table index
+prntop:   lda       (pcl), y
+          jsr       prbyte
+          ldx       #$01                ; Print 2 blanks
+prntbl:   jsr       prbl2
+          cpy       length              ; Print instruction (1-3 bytes)
+          iny                           ;   in a 12-char field
+          bcc       prntop
+          ldx       #$03
+          cpy       #$04
+          bcc       prntbl
+          pla                           ; Recover mnemonic index
+          tay
+          lda       mneml, y
+          sta       lmnem               ; Fetch 3-char mnemonic (word packed)
+          lda       mnemr, y
+          sta       rmnem
+prmn1:    lda       #$00
+          ldy       #$05
+prmn2:    asl       rmnem               ; Shift 5 bytes of character into A
+          rol       lmnem
+          rol                           ; (clears carry)
+          dey
+          bne       prmn2
+          adc       #'?'+$80            ; Add "?" offset
+          jsr       cout
+          dex
+          bne       prmn1
+          jsr       prblnk              ; Output 3 blanks
+          ldy       length
+          ldx       #$06                ; Count for 6 format bits
+pradr1:   cpx       #$03
+          beq       pradr5              ; If X=3 then address
+pradr2:   asl       format
+          bcc       pradr3
+          lda       char1-1, x
+          jsr       cout
+          lda       char2-1, x
+          beq       pradr3
+          jsr       cout
+pradr3:   dex
+          bne       pradr1
+          rts
+pradr4:   dey
+          bmi       pradr2
+          jsr       prbyte
+pradr5:   lda       format
+          cmp       #$E8                ; Special handling for relative mode
+          lda       (pcl), y
+          bcc       pradr4
+reladr:   jsr       pcadj3
+          tax
+          inx
+          bne       prntyx
+          iny
+prntyx:   tya
+prntax:   jsr       prbyte
+prntx:    txa
+          jmp       prbyte
+
+prblnk:   ldx       #$03                ; Blank count
+prbl2:    lda       #' '+$80
+prbl3:    jsr       cout
+          dex
+          bne       prbl2
+          rts
+
+pcadj:    sec                           ; 0=1 byte, 1=2 bytes, 2=3 bytes
+pcadj2:   lda       length
+pcadj3:   ldy       pch
+          tax                           ; Test displacement sign
+          bpl       pcadj4              ;   (for relative branch)
+          dey                           ; Extend negative by decrementing PCH
+pcadj4:   adc       pcl
+          bcc       rts2                ; PCL+LENGTH or displ. +1 to A
+          iny                           ; carry into Y (PCH)
+rts2:     rts
+
+; =============================================================================
+; OPTBL is a table containing the new 65C02 opcodes which do not fit into the
+; existing 6502 lookup table.
+; =============================================================================
+
+optbl:    .byte     $12                 ; ORA (ZP)
+          .byte     $14                 ; TRB ZP
+          .byte     $1A                 ; INC A
+          .byte     $1C                 ; TRB ABS
+          .byte     $32                 ; AND (ZP)
+          .byte     $34                 ; BIT ZP,X
+          .byte     $3A                 ; DEC A
+          .byte     $3C                 ; BIT ABS,X
+          .byte     $52                 ; EOR (ZP)
+          .byte     $5A                 ; PHY
+          .byte     $64                 ; STZ ZP
+          .byte     $72                 ; ADC (ZP)
+          .byte     $74                 ; STZ ZP,X
+          .byte     $7A                 ; PLY
+          .byte     $7C                 ; JMP (ABS,X)
+          .byte     $89                 ; BIT #
+          .byte     $92                 ; STA (ZP)
+          .byte     $9C                 ; STZ ABS
+          .byte     $9E                 ; STZ ABS,X
+          .byte     $B2                 ; LDA (ZP)
+          .byte     $D2                 ; CMP (ZP)
+          .byte     $F2                 ; SBC (ZP)
+          .byte     $FC                 ; ???
+
+numops     =        *-(optbl-1)         ; Number of bytes to check
+
+; =============================================================================
+; INDX contains pointers to the mnemonics for each of the opcodes in OPTBL.
+; Pointers with bit 7 set indicate extensions to MNEML or MNEMR.
+; =============================================================================
+
+indx:     .byte     $38, $43, $37, $43, $39, $21, $36, $21
+          .byte     $3A, $40, $42, $3B, $42, $41, $22, $21
+          .byte     $3C, $42, $42, $3D, $3E, $3F, $44
+
+; =============================================================================
+; FMT1 bytes:  XXXXXXY0 instructions
+;   if Y=0  right nibble
+;   if Y=1  left nibble
+;     (X=index)
+; =============================================================================
+
+fmt1:     .byte     $0F, $22, $FF, $33, $CB, $62, $FF, $73
+          .byte     $03, $22, $FF, $33, $CB, $66, $FF, $77
+          .byte     $0F, $20, $FF, $33, $CB, $60, $FF, $70
+          .byte     $0F, $22, $FF, $39, $CB, $66, $FF, $7D
+          .byte     $0B, $22, $FF, $33, $CB, $A6, $FF, $73
+          .byte     $11, $22, $FF, $33, $CB, $A6, $FF, $87
+          .byte     $01, $22, $FF, $33, $CB, $60, $FF, $70
+          .byte     $01, $22, $FF, $33, $CB, $60, $FF, $70
+          .byte     $24, $31, $65, $78
+
+; =============================================================================
+; ZZXXXY01 instructions
+; =============================================================================
+
+fmt2:     .byte     $00                 ; error
+          .byte     $21                 ; immediate
+          .byte     $81                 ; zero page
+          .byte     $82                 ; absolute
+          .byte     $59                 ; (ZP,X)
+          .byte     $4D                 ; (ZP),Y
+          .byte     $91                 ; ZP,X
+          .byte     $92                 ; ABS,X
+          .byte     $86                 ; ABS,Y
+          .byte     $4A                 ; (ABS)
+          .byte     $85                 ; ZP,Y
+          .byte     $9D                 ; relative
+          .byte     $49                 ; (ZP) (new to 65C02)
+          .byte     $5A                 ; (ABS,X) (new to 65C02)
+
+char2:    .byte     'Y'+$80
+          .byte     $00                 ; byte F of FMT2
+          .byte     'Y'+$80
+          .byte     '$'+$80
+          .byte     '$'+$80
+          .byte     $00
+
+char1:    .byte     ','+$80
+          .byte     ')'+$80
+          .byte     ','+$80
+          .byte     '#'+$80
+          .byte     '('+$80
+          .byte     '$'+$80
+
+mneml:    .byte     $1C
+          .byte     $8A
+          .byte     $1C
+          .byte     $23
+          .byte     $5D
+          .byte     $8B
+          .byte     $1B
+          .byte     $A1
+          .byte     $9D
+          .byte     $8A
+          .byte     $1D
+          .byte     $23
+          .byte     $9D
+          .byte     $8B
+          .byte     $1D
+          .byte     $A1
+          .byte     $1C                 ; BRA
+          .byte     $29
+          .byte     $19
+          .byte     $AE
+          .byte     $69
+          .byte     $A8
+          .byte     $19
+          .byte     $23
+          .byte     $24
+          .byte     $53
+          .byte     $1B
+          .byte     $23
+          .byte     $24
+          .byte     $53
+          .byte     $19
+          .byte     $A1                 ; (A) format above
+          .byte     $AD                 ; TSB
+          .byte     $1A
+          .byte     $5B
+          .byte     $5B
+          .byte     $A5
+          .byte     $69
+          .byte     $24
+          .byte     $24                 ; (B) format
+          .byte     $AE
+          .byte     $AE
+          .byte     $A8
+          .byte     $AD
+          .byte     $29
+          .byte     $8A
+          .byte     $7C
+          .byte     $8B                 ; (C) format
+          .byte     $15
+          .byte     $9C
+          .byte     $6D
+          .byte     $9C
+          .byte     $A5
+          .byte     $69
+          .byte     $29
+          .byte     $53                 ; (D) format
+          .byte     $84
+          .byte     $13
+          .byte     $34
+          .byte     $11
+          .byte     $A5
+          .byte     $69
+          .byte     $23                 ; (E) format
+          .byte     $A0
+
+; =============================================================================
+; Extension to MNEML (left mnemonics)
+; =============================================================================
+
+          .byte     $8A                 ; PHY
+          .byte     $8B                 ; PLY
+          .byte     $A5                 ; STZ
+          .byte     $AC                 ; TRB
+          .byte     $00                 ; ???
+
+mnemr:    .byte     $D8
+          .byte     $62
+          .byte     $5A
+          .byte     $48
+          .byte     $26
+          .byte     $62
+          .byte     $94
+          .byte     $88
+          .byte     $54
+          .byte     $44
+          .byte     $C8
+          .byte     $54
+          .byte     $68
+          .byte     $44
+          .byte     $E8
+          .byte     $94
+          .byte     $C4                 ; BRA
+          .byte     $B4
+          .byte     $08
+          .byte     $84
+          .byte     $74
+          .byte     $B4
+          .byte     $28
+          .byte     $6E
+          .byte     $74
+          .byte     $F4
+          .byte     $CC
+          .byte     $4A
+          .byte     $72
+          .byte     $F2
+          .byte     $A4
+          .byte     $8A                 ; (A) format
+          .byte     $06                 ; TSB
+          .byte     $AA
+          .byte     $A2
+          .byte     $A2
+          .byte     $74
+          .byte     $74
+          .byte     $74
+          .byte     $72                 ; (B) format
+          .byte     $44
+          .byte     $68
+          .byte     $B2
+          .byte     $32
+          .byte     $B2
+          .byte     $72
+          .byte     $22
+          .byte     $72                 ; (C) format
+          .byte     $1A
+          .byte     $1A
+          .byte     $26
+          .byte     $26
+          .byte     $72
+          .byte     $72
+          .byte     $88
+          .byte     $C8                 ; (D) format
+          .byte     $C4
+          .byte     $CA
+          .byte     $26
+          .byte     $48
+          .byte     $44
+          .byte     $44
+          .byte     $A2
+          .byte     $C8                 ; (E) format
+
+; =============================================================================
+; Right half of new mnemonics, indexed from MNEMR (via indx)
+; =============================================================================
+
+          .byte     $74                 ; PHY
+          .byte     $74                 ; PLY
+          .byte     $76                 ; STZ
+          .byte     $C6                 ; TRB
+          .byte     $00                 ; ???
+
+rtbl:     .byte     'A'+$80, 'X'+$80, 'Y'+$80, 'P'+$80, 'S'+$80
+
+regdsp:   jsr       crout               ; Display labelled register contents
+rgdsp1:   lda       #<acc
+          sta       a3l
+          lda       #>acc
+          sta       a3h
+          ldx       #$FB
+rdsp1:    lda       #' '+$80
+          jsr       cout
+          lda       rtbl-$FB, x
+          jsr       cout
+          lda       #'='+$80
+          jsr       cout
+          lda       acc+5, x
+rgdsp2:   jsr       prbyte
+          inx
+          bmi       rdsp1
+          rts
+
+cleanup:  phx
+          jsr       clreol
+          plx
+          rts
+
+clreol:   bit       ingmod              ; Don't do this in graphics mode
+          bne       @2
+          lda       xoff
+          tax
+          jsr       getcsr
+          lda       #$A0
+@1:       sta       abwrdat
+          inx
+          cpx       #$28                ; 40 columns
+          bcc       @1
+@2:       rts
+
+pick:     lda       xoff
+          tax
+          clc
+          adc       csrlin
+          sta       abwrreg
+          lda       #$00
+          adc       csrlin+1
+          and       #$3F
+          sta       abwrreg
+          lda       abrddat
+          rts
+
+getcsr:   lda       xoff
+          clc
+          adc       csrlin
+          sta       abwrreg
+          lda       #$00
+          adc       csrlin+1
+          sta       abwrreg
+          rts
+
+esc:      jsr       pick
+          pha
+          jsr       getcsr
+          lda       #'^'+$80
+          sta       abwrdat
+          jsr       getch
+          sta       basadr
+          jsr       getcsr
+          pla
+          sta       abwrdat
+          lda       basadr
+          cmp       #'E'+$80
+          beq       esccl
+          cmp       #$8B
+          beq       escup
+          cmp       #$88
+          beq       esclt
+          cmp       #$95
+          beq       escrt
+          cmp       #$8A
+          beq       escdn
+          rts
+esccl:    jmp       clreol
+escup:    phx
+          ldx       yoff
+          beq       escout
+          dex
+          jsr       vtab
+escout:   plx
+          bra       esc
+esclt:    phx
+          jsr       bs
+          bra       escout
+escrt:    lda       xoff
+          cmp       #$27
+          bcs       @1
+          inc       xoff
+          bra       esc
+@1:       jsr       cr
+          bra       esc
+escdn:    jsr       lf
+          bra       esc
+
+hgrinit:  lda       #$FF
+          sta       ingmod
+          lda       #<hputch
+          sta       $36
+          lda       #>hputch
+          sta       $37
+          ldy       #$08
+          jsr       iniany
+          lda       #$00                ; Fill from 2000 to 3800 with our color
+          sta       abwrreg
+          lda       #$60
+          sta       abwrreg
+          ldx       #$18
+          ldy       #$00
+          lda       #$F1                ; White on black
+@1:       sta       abwrdat
+          iny                           ; $0100 times
+          bne       @1
+          dex                           ; $1800 times
+          bne       @1
+          ldy       #$00                ; The Name Table needs to be filled
+          ldx       #$03                ; with 2.5 iterations of the bytes
+@2:       sty       abwrdat             ; 00-FF in order to act like APA mode.
+          iny
+          bne       @2                  ; Each iteration
+          dex                           ; 3 iterations
+          bne       @2
+          lda       #$00                
+          sta       abwrreg
+          lda       #$54
+          sta       abwrreg
+          lda       #<font
+          sta       basadr
+          lda       #>font
+          sta       basadr+1
+          ldy       #$00
+          ldx       #$04                ; Copy 4*256 bytes
+@3:       lda       (basadr), y
+          sta       abwrdat
+          iny                           ; Zoom zoom zoom
+          bne       @3
+          inc       basadr+1
+          dex
+          bne       @3
+hhome:    lda       #$80                ; Set up last 4 rows (3A80)
+          sta       abwrreg
+          lda       #$7A
+          sta       abwrreg
+          ldy       #$80
+          lda       #' '+$80
+@1:       sta       abwrdat
+          dey
+          bne       @1                  ; FALL INTO
+          ldx       #$00
+          stx       xoff
+hvtab:    stx       yoff
+          txa
+          and       #$03
+          clc
+          asl
+          tax
+          lda       linlut32, x
+          sta       csrlin
+          lda       linlut32+1, x
+          sta       csrlin+1
+          rts
+
+hgetch:   lda       keyb                ; Graphics mode no cursor
+          bpl       hgetch
+          sta       keyb
+          sta       tmpad2+1            ; Save the key
+          pla                           ; Restore X & Y regs
+          tay
+          pla
+          tax
+          lda       tmpad2+1            ; Retrieve the key that was pressed
+          rts
+
+hputch:   sta       holda
+          txa
+          pha
+          tya
+          pha
+          lda       holda
+          jsr       hdoputch
+          pla
+          tay
+          pla
+          tax
+          lda       holda
+          rts
+
+hbs:      ldx       xoff
+          beq       @1
+          dex
+          stx       xoff
+          rts
+@1:       ldx       yoff
+          beq       @2
+          dex
+@2:       bra       hvtab
+
+hdoputch: and       #$7F                ; Force high bit off
+          cmp       #$08                ; BS?
+          beq       hbs                 ; Yes; handle it
+          cmp       #$0D                ; CR?
+          beq       @2                  ; Yes; handle it
+          cmp       #' '                ; Other control char?
+          bcc       @1                  ; Yes; just peace out
+          clc
+          lda       xoff
+          tax
+          adc       csrlin
+          sta       abwrreg
+          lda       #$00
+          adc       csrlin+1
+          sta       abwrreg
+          clc
+          lda       holda               ; Retrieve character
+          ora       #$80                ; Force high bit on
+          sta       abwrdat             ; Write it
+          inx                           ; See if we need to scroll
+          stx       xoff
+          cpx       #$20
+          bcs       @2
+@1:       rts
+@2:       lda       #$00
+          sta       xoff
+          lda       yoff                ; Need to scroll?
+          cmp       #$03
+          bcs       hscroll
+          tax                           ; Increase line number
+          inx
+          jmp       hvtab               ; ALWAYS
+
+hscroll:  ldy       #$60                ; Move the contents of text window
+          lda       #$80                ; (3A80) up by 32 bytes
+          sta       csrlin
+          lda       #$A0
+          sta       basadr
+          lda       #$3A
+          sta       basadr+1
+          ora       #$40
+          sta       csrlin+1
+@1:       lda       basadr              ; Read address
+          sta       abwrreg
+          lda       basadr+1
+          sta       abwrreg
+          ldx       abrddat
+          lda       csrlin              ; Write address
+          sta       abwrreg
+          lda       csrlin+1
+          sta       abwrreg
+          stx       abwrdat
+          inc       csrlin
+          bne       @2
+          inc       csrlin+1
+@2:       inc       basadr
+          bne       @3
+          inc       basadr+1
+@3:       dey                           ; Tick down
+          bne       @1                  ; Until 96 bytes moved
+          ldx       #$20                ; Then write 32 spaces
+          lda       #' '+$80
+@4:       sta       abwrdat
+          dex
+          bne       @4
+          stx       xoff                ; And set position to X=0 Y=3
+          ldx       #$03
+          jmp       hvtab
+
+plot:
+@1:       sta       pacc
+          stx       px
+          sty       py
+          txa
+          and       #$F8
+          sta       paddr
+          tya
+          and       #$07
+          ora       paddr
+          sta       paddr
+          tya
+          and       #$F8
+          clc
+          lsr
+          lsr
+          lsr
+          sta       paddr+1
+          txa
+          and       #$07
+          tax
+          lda       hmask, x
+          sta       pmask
+          lda       paddr               ; Read the old byte
+          sta       abwrreg
+          lda       paddr+1
+          sta       abwrreg
+          lda       abrddat
+          sta       pdata               ; Save it
+          lda       hcolor              ; Color = 0?
+          bne       @2                  ; No; skip
+          lda       pmask               ; Negative mask
+          eor       #$FF
+          and       pdata               ; Mask it out
+          jmp       @3
+@2:       lda       pmask               ; Mask it in
+          ora       pdata
+@3:       sta       pdata               ; Save the new byte
+          lda       paddr               ; Direct the VDP
+          sta       abwrreg
+          lda       paddr+1
+          ora       #$40                ; Write, not read
+          sta       abwrreg
+          lda       pdata
+          sta       abwrdat             ; Write the new byte
+          lda       hcolor              ; If we are ADDING a pixel, set color
+          beq       @4                  ; We're not; ignore.
+          lda       hcolor
+          and       #$F0                ; Only part we care about.
+          ora       #$01                ; Background to black.
+          sta       pmask
+          lda       paddr               ; Write address + $2000 to the VDP.
+          sta       abwrreg
+          lda       paddr+1
+          ora       #$60
+          sta       abwrreg
+          lda       pmask
+          sta       abwrdat             ; Write new color code.
+@4:       lda       pacc
+          ldx       px
+          ldy       py
+          rts
+          
+hmask:    .byte     $80, $40, $20, $10, $08, $04, $02, $01
+
+txtregs:  .byte     $00, $D0 | (VSYNC_IRQ * $20), $02, $00, $00, $20, $00, $F5
+
+; ============================================================================
+; By setting register 1 to $C0 instead of $C2, by default sprites will be 8x8
+; same as a character.  ($C1 will double-scale this.)
+;
+; By setting register 5 to $7F, the Sprite Attribute Table will be located at
+; 16256 ($3F80), otherwise unused.
+;
+; By setting register 6 to $03, the Sprite Pattern Table will be located at
+; 6144 ($1800), otherwise unused.
+;
+; By setting register 6 to $02, the Sprite Pattern Table will be located at
+; 4096 ($1000), which is the same address as the third pattern table, meaning
+; that definitions 160-255 will produce ASCII characters.  Use VDP 6,2 to set
+; this mode.
+;
+; The SAT is a 128-byte table, consisting of 32 entries with the following
+; format:
+;   $00: Y-position (if >191, is considered negative)
+;   $01: X-position
+;   $02: Glyph identifier
+;   $03: Low nibble = color
+;        $80 bit = subtracts 32 from X-position
+;
+; The original registers from the datasheet are commented out below.
+; ============================================================================
+
+;aparegs: .byte     $02, $C2, $0E, $FF, $03, $76, $03, $F1
+aparegs:  .byte     $02, $C0 | (VSYNC_IRQ * $20), $0E, $FF, $03, $7F, $03, $F1
+
+linlut:   .word     $4800, $4828, $4850, $4878, $48A0, $48C8, $48F0, $4918
+          .word     $4940, $4968, $4990, $49B8, $49E0, $4A08, $4A30, $4A58
+          .word     $4A80, $4AA8, $4AD0, $4AF8, $4B20, $4B48, $4B70, $4B98
+
+linlut32: .word     $7A80, $7AA0, $7AC0, $7AE0
+
+; ============================================================================
+; The top of the mini-assembler.
+; ============================================================================
+
+amod1:    jsr       nnbl                ; get next non-blank
+          sty       ysav                ; save Y
+          cmp       char1, x  
+          bne       amod2 
+          jsr       nnbl                ; get next non-blank
+          cmp       char2, x
+          beq       amod3
+          lda       char2, x            ; done yet?
+          beq       amod4 
+          cmp       #'$'+$80            ; if "$" then done
+          beq       amod4
+          ldy       ysav                ; restore Y
+amod2:    clc
+amod4:    dey
+amod3:    rol       a5l                 ; shift bit into format
+          cpx       #$03
+          bne       amod6 
+          jsr       getnum
+          lda       a2h                 ; get high byte of address
+          beq       amod5               ; =>
+          inx
+amod5:    stx       ysav1
+          ldx       #$03
+          dey
+amod6:    stx       a1h
+          dex
+          bpl       amod1
+          rts
+
+; Calculate offset byte for relative addresses
+
+rel:      sbc       #$81                ; calc relative address
+          lsr
+          bne       goerr               ; bad branch
+          ldy       a2h
+          ldx       a2l
+          bne       rel1
+          dey                           ; point to offset
+rel1:     dex                           ; displacement - 1
+          txa
+          clc
+          sbc       pcl                 ; subtract current PCL
+          sta       a2l                 ; and save as displacement
+          bpl       rel2                ; check page
+          iny
+rel2:     tya                           ; get page
+          sbc       pch                 ; check page
+goerr:    bne       minierr             ; display error
+
+; Move instruction to memory
+
+movinst:  ldy       length              ; get instruction length
+mov1:     lda       a1h, y              ; get a byte
+          sta       (pcl), y            ; and move it
+          dey
+          bpl       mov1
+
+; Display instruction
+
+          jsr       prblnk
+          jsr       up2
+dislin:   jsr       showinst            ; Display line & get next instruction
+getinst1:                               ; Get the next instruction
+          lda       #'!'+$80            ; ! for prompt
+          sta       prompt
+          jsr       getlnz              ; Get a line
+          jmp       doinst              ; Go do the instruction
+
+; Compare disassembly of all known opcodes with
+; the one typed in until a match is found
+
+getop:    lda       a1h                 ; get opcode
+          jsr       insds2              ; determine mnemonic index
+          tax                           ; X = index
+          lda       mnemr, x            ; get right half of index
+          cmp       a4l                 ; does it match entry?
+          bne       nxtop               ; =>try next opcode
+          lda       mneml, x            ; get left half of index
+          cmp       a4h                 ; does it match entry?
+          bne       nxtop               ; =>no, try next opcode
+          lda       a5l                 ; found opcode, check address mode
+          ldy       format              ; get addr. mode format for that opcode
+          cpy       #$9D                ; is it relative?
+          beq       rel                 ; =>yes, calc relative address
+          cmp       format              ; does mode match?
+          beq       movinst             ; =>yes, move instruction to memory
+nxtop:    dec       a1h                 ; else try next opcode
+          bne       getop               ; =>go try it
+          inc       a5l                 ; else try next format
+          dec       ysav1 
+          beq       getop               ; =>go try next format
+
+; Point to the error with a caret, beep, and fall 
+; into the mini-assembler.
+
+minierr:  ldy       ysav                ; get position
+err2:     tya
+          tax
+err3:     jsr       prbl2
+          lda       #'^'+$80            ; ^ to point to error
+          jsr       cout
+          jsr       bell                ; Beep cause we're mad
+          bra       getinst1            ; try again
+
+up2:      pha
+          phx
+          phy
+          ldx       yoff
+          beq       @1
+          dex
+          beq       @1
+          dex
+@1:       jsr       vtab
+          ply
+          plx
+          pla
+          rts
+
+; ============================================================================
+; Common API vectors.
+; ============================================================================
+
+          .res      $FF00-*
+vmon:     jmp       mon                 ; $FF00 -256
+vgetch:   jmp       rdkey               ; $FF03 -253
+vputch:   jmp       cout                ; $FF06 -250
+vclrscr:  jmp       home                ; $FF09 -247
+vclreol:  jmp       clreol              ; $FF0C -244
+vinitxt:  jmp       initxt              ; $FF0F -241
+vhgrini:  jmp       hgrinit             ; $FF12 -238
+
+; ============================================================================
+; The rest of the mini-assembler.
+; ============================================================================
+
+; Read a line of input.  If prefaced with " ", decode
+; mnemonic. If "$" do monitor command.  Otherwise parse
+; hex address before decoding mnemonic.
+
+doinst:   jsr       zmode               ; clear mode
+          lda       in                  ; get first char in line
+          cmp       #' '+$80            ; if blank, 
+          beq       dolin               ; =>go attempt disassembly
+          cmp       #$8D                ; is it return?
+          bne       geti1               ; =>no, continue
+          rts                           ; else return to Monitor
+
+geti1:    jsr       getnum              ; parse hexadecimal input
+          cmp       #$93                ; look for "ADDR:" 
+goerr2:   bne       err2                ; no ":", display error 
+          txa                           ; X nonzero if address entered
+          beq       err2                ; no "ADDR", display error
+          jsr       a1pclp              ; move address to pc
+dolin:    lda       #$03                ; get starting opcode
+          sta       a1h                 ; and save
+nxtch:    jsr       nnbl                ; get next non-blank
+          asl                           ; validate entry
+          sbc       #$BE
+          cmp       #$C2
+          bcc       err2                ; =>flag bad mnemonic
+
+; Form mnemonic for later comparison
+
+          asl
+          asl
+          ldx       #$04
+nxtmn:    asl
+          rol       a4l 
+          rol       a4h
+          dex
+          bpl       nxtmn
+          dec       a1h                 ; decrement mnemonic count
+          beq       nxtmn
+          bpl       nxtch
+          ldx       #$05                ; index into address mode tables
+          jsr       amod1               ; do this elsewhere
+          lda       a5l                 ; get format
+          asl
+          asl
+          ora       ysav1
+          cmp       #$20
+          bcs       amod7
+          ldx       ysav1               ; get our format
+          beq       amod7 
+          ora       #$80 
+amod7:    sta       a5l                 ; update format
+          sty       ysav                ; update position
+          lda       in, y               ; get next character
+          cmp       #';'+$80            ; is it a ";"?
+          beq       amod8               ; =>yes, skip comment
+          cmp       #$8D                ; is it carriage return
+          bne       goerr2
+amod8:    jmp       getop               ; get next opcode
+
+; NNBL - Gets a non blank character for the mini assembler
+
+nnbl:     lda       in, y               ; Get character
+          iny
+          ora       #$80
+          cmp       #' '+$80            ; Blank?
+          beq       nnbl
+          jmp       upshift
+
+showinst: jsr       instdsp
+          jsr       pcadj
+          sta       pcl
+          sty       pch
+          rts
+
+          .res      $FFF9-*
+revision: .byte     $00
+vnmi:     .word     entry               ; XXX
+vreset:   .word     entry
+virq:     .word     irq

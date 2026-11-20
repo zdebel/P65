@@ -1,0 +1,26 @@
+.program clk
+.side_set 1 opt
+
+.wrap_target
+start:
+    set pins, 0b10 side 1 [3] ; Bufor B0 (A0..A7), CLK=1 (4 cykle: 0..3) -> 71.4 ns
+    in  pins, 8               ; Odczyt A0..A7 (1 cykl: 4)
+    set pins, 0b01 [3]        ; Bufor B1 (A8..A15), CLK=1 (4 cykle: 5..8) -> 71.4 ns
+    in  pins, 24              ; Odczyt A8..A15, D0..D7, RW -> autopush (1 cykl: 9)
+    jmp pin read              ; Sprawdz RW (1 cykl: 10) -> Razem wspolne: 11 cykli
+
+write:
+    nop [4]                   ; Wyrownaj faze HIGH do 20 cykli (5 cykli: 11..15)
+    nop [3]                   ; (4 cykle: 16..19) -> Razem HIGH = 20 cykli
+    nop side 0 [6]            ; Faza LOW, CLK=0 (7 cykli: 20..26)
+    jmp start                 ; Powrot do start (1 cykl: 27) -> Razem LOW = 8 cykli
+
+read:
+    nop [2]                   ; Czas dla Core 1 na odczyt z RAM (3 cykle: 11..13)
+    mov osr, ~null            ; Przygotuj maske wyjscia (1 cykl: 14)
+    out pindirs, 8 [1]        ; D0..D7 jako wyjscia (2 cykle: 15..16) -> 7 cykli od autopusha = 125 ns!
+    out pins, 8 [1]           ; Wystaw dane z TX FIFO i trzymaj (2 cykle: 17..18)
+    mov osr, null             ; Przygotuj maske wejscia, dane trwaja na szynie (1 cykl: 19) -> Razem HIGH = 20 cykli
+    out pindirs, 8 side 0 [4] ; CLK=0! D0..D7 jako wejscia (5 cykli: 20..24)
+    nop [2]                   ; Czekaj w fazie LOW (3 cykle: 25..27)
+.wrap                         ; Powrot do start przez wrap (0 cykli) -> Razem LOW = 8 cykli
