@@ -27,7 +27,7 @@ Press **F1** in the emulator for the keyboard layout and shortcuts.
 * WDC 65C02 core (RMB/SMB/BBR/BBS, WAI, STP, decimal mode), validated with Klaus Dormann's test suites;
 * TMS9918 (all modes, sprites, 60 Hz VSYNC interrupt on /IRQ) with a VDP viewer (tiles, sprites, VRAM map);
 * debugger with colored disassembly, breakpoints, a scrollable memory view and register highlighting;
-* flash storage like the real device (`SAVE`, `LOAD`, `BSAVE`, `BLOAD`, `BRUN`, `CATALOG`, ...) and a
+* flash storage like the real device (same format, in pure Python) (`SAVE`, `LOAD`, `BSAVE`, `BLOAD`, `BRUN`, `CATALOG`, ...) and a
   storage manager (Ctrl+Shift+T) that copies files to and from the real P65 over USB.
 
 ## Memory map
@@ -43,11 +43,10 @@ Press **F1** in the emulator for the keyboard layout and shortcuts.
 
 ## Notes
 
-* **Storage library.** The storage code is the firmware's own file system in C (`emulator/native/`), loaded
-  through ctypes. Windows x64 has a prebuilt `emulator/p65store.dll`. On Linux and macOS the emulator compiles
-  it by itself the first time storage is used, if `cc` / `gcc` / `clang` is installed (Debian/Ubuntu:
-  `sudo apt install build-essential`; macOS: `xcode-select --install`). You can also build it by hand:
-  `python emulator/build_storelib.py`. Without a compiler everything else still runs, only storage is off.
+* **Storage** is the firmware's file system, mailbox and USB protocol ported to pure Python
+  (`emulator/p65fs.py`). No compiler, DLL or extra library is needed, so everything runs on Windows,
+  Linux and macOS. It keeps the real device's on-flash format, so a storage image can be moved between the
+  emulator and the device.
 * `emulator/rom/p65_basic.bin` is the BASIC ROM of the P65. Its interpreter descends from
   [mist64/msbasic](https://github.com/mist64/msbasic) (Microsoft BASIC), whose copyright belongs to
   its original authors; the MIT license of this repository covers the P65 code only.

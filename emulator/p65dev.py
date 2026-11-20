@@ -2,7 +2,7 @@
 
 Talks to the device through any object with write(bytes) and read(n) -> bytes
 (returning b'' on timeout): a pyserial port, or LoopbackTransport(store) which
-runs the firmware's own protocol code from p65store.dll (used by the tests).
+runs the Python port of the firmware's protocol code (p65fs.py; used by the tests).
 """
 
 import struct

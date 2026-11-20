@@ -341,7 +341,7 @@ class StorageDialog(QDialog):
     def set_store(self, store):
         self.local.set_backend(IO.LocalBackend(store) if store is not None else None)
         if store is None:
-            self.local.info.setText('p65store.dll missing - run emulator/build_storelib.py')
+            self.local.info.setText('storage not available')
 
     def scan_ports(self):
         cur = self.ports.currentData()
